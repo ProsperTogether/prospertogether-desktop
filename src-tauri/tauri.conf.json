@@ -1,0 +1,74 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicabar/tauri/refs/heads/v2/packages/tauri/schema.json",
+  "productName": "Prosper Together",
+  "version": "1.0.0",
+  "identifier": "com.prospertogether.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Prosper Together",
+        "width": 900,
+        "height": 700,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "Prosper Together"
+    },
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/recordings/**",
+          "$APPDATA/recordings/**/*"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "app", "dmg"],
+    "externalBin": ["binaries/ffmpeg", "binaries/whisper"],
+    "resources": ["resources/models/*", "binaries/*.dll"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "wix": {
+        "upgradeCode": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/ProsperTogether/prospertogether-desktop/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE4QzFGNTYyNDk5N0I5NkMKUldSc3VaZEpZdlhCcUNMQmthOFJHZU50dUt5VWNnb05LMG9hcTZaZGRvUll4RlcwbnRudG05aUYK"
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["prospertogether"]
+      }
+    },
+    "shell": {
+      "open": true
+    }
+  }
+}

@@ -1,0 +1,424 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      base_version: ${{ steps.version.outputs.base_version }}
+      release_version: ${{ steps.version.outputs.release_version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Compute next patch release version
+        id: version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tomllib
+
+          cargo_toml = pathlib.Path("src-tauri/Cargo.toml")
+          cargo_lock = pathlib.Path("src-tauri/Cargo.lock")
+          tauri_conf = pathlib.Path("src-tauri/tauri.conf.json")
+          package_json = pathlib.Path("package.json")
+          package_lock = pathlib.Path("package-lock.json")
+
+          cargo_data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+          base_version = cargo_data["package"]["version"].strip()
+          stable_semver = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+          def parse_version(value: str) -> tuple[int, int, int]:
+              match = stable_semver.fullmatch(value.strip())
+              if not match:
+                  raise SystemExit(
+                      f"Expected a stable version like 0.2.1 or v0.2.1, got `{value}`."
+                  )
+              return tuple(int(group) for group in match.groups())
+
+          latest_tag = ""
+          latest_tag_version = None
+          for raw_tag in subprocess.check_output(
+              ["git", "tag", "--list", "v*", "--sort=-v:refname"],
+              text=True,
+          ).splitlines():
+              tag = raw_tag.strip()
+              if stable_semver.fullmatch(tag):
+                  latest_tag = tag
+                  latest_tag_version = parse_version(tag)
+                  break
+
+          base_tuple = parse_version(base_version)
+          if latest_tag_version is None:
+              release_version = base_version
+          elif base_tuple > latest_tag_version:
+              release_version = base_version
+          else:
+              major, minor, patch = latest_tag_version
+              release_version = f"{major}.{minor}.{patch + 1}"
+
+          # 1) Update Cargo.toml (src-tauri/Cargo.toml) [package] version
+          cargo_lines = cargo_toml.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_package = False
+          cargo_updated = False
+          for index, line in enumerate(cargo_lines):
+              stripped = line.strip()
+              if stripped == "[package]":
+                  in_package = True
+                  continue
+              if in_package and stripped.startswith("[") and stripped != "[package]":
+                  in_package = False
+              if in_package and stripped.startswith('version = "') and not cargo_updated:
+                  cargo_lines[index] = re.sub(
+                      r'version = "[^"]+"',
+                      f'version = "{release_version}"',
+                      line,
+                      count=1,
+                  )
+                  cargo_updated = True
+                  break
+          if not cargo_updated:
+              raise SystemExit("Failed to update package version in src-tauri/Cargo.toml.")
+          cargo_toml.write_text("".join(cargo_lines), encoding="utf-8")
+
+          # 2) Update Cargo.lock — the root package entry for prospertogether-desktop
+          lock_lines = cargo_lock.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_package = False
+          target_package = False
+          lock_updated = False
+          for index, line in enumerate(lock_lines):
+              stripped = line.strip()
+              if stripped == "[[package]]":
+                  in_package = True
+                  target_package = False
+                  continue
+              if in_package and stripped.startswith('name = "'):
+                  target_package = stripped == 'name = "prospertogether-desktop"'
+                  continue
+              if in_package and target_package and stripped.startswith('version = "') and not lock_updated:
+                  lock_lines[index] = re.sub(
+                      r'version = "[^"]+"',
+                      f'version = "{release_version}"',
+                      line,
+                      count=1,
+                  )
+                  lock_updated = True
+                  break
+          if not lock_updated:
+              raise SystemExit("Failed to update the root package version in src-tauri/Cargo.lock.")
+          cargo_lock.write_text("".join(lock_lines), encoding="utf-8")
+
+          # 3) Update tauri.conf.json top-level "version"
+          conf_text = tauri_conf.read_text(encoding="utf-8")
+          conf_data = json.loads(conf_text)
+          conf_data["version"] = release_version
+          tauri_conf.write_text(
+              json.dumps(conf_data, indent=2) + "\n", encoding="utf-8"
+          )
+
+          # 4) Update package.json "version"
+          pkg_text = package_json.read_text(encoding="utf-8")
+          pkg_data = json.loads(pkg_text)
+          pkg_data["version"] = release_version
+          package_json.write_text(
+              json.dumps(pkg_data, indent=2) + "\n", encoding="utf-8"
+          )
+
+          # 5) Update package-lock.json (top-level + packages."" version)
+          if package_lock.exists():
+              lock_text = package_lock.read_text(encoding="utf-8")
+              lock_data = json.loads(lock_text)
+              lock_data["version"] = release_version
+              if "packages" in lock_data and "" in lock_data["packages"]:
+                  lock_data["packages"][""]["version"] = release_version
+              package_lock.write_text(
+                  json.dumps(lock_data, indent=2) + "\n", encoding="utf-8"
+              )
+
+          output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"base_version={base_version}\n")
+              handle.write(f"release_version={release_version}\n")
+              handle.write(f"tag_name=v{release_version}\n")
+
+          print(f"Current branch version: {base_version}")
+          print(f"Latest existing tag: {latest_tag or 'none'}")
+          print(f"Next release version: {release_version}")
+          PY
+
+      - name: Commit version bump back to branch
+        id: commit
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json package.json package-lock.json
+          if git diff --cached --quiet; then
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git \
+            -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "[skip ci] chore(release): bump version to ${VERSION}"
+          git push origin "HEAD:${TARGET_BRANCH}"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows-x86_64
+            rust_target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windows-aarch64
+            rust_target: aarch64-pc-windows-msvc
+          - runner: macos-15
+            platform: macos-aarch64
+            rust_target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+
+      - name: Validate release signing configuration
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "Missing secret: TAURI_SIGNING_PRIVATE_KEY" >&2
+            exit 1
+          fi
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: npm ci
+
+      - name: Download sidecar binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f scripts/download-sidecars.sh ]; then
+            bash scripts/download-sidecars.sh
+          else
+            echo "No sidecar download script found; skipping"
+          fi
+
+      - name: Download sidecar binaries (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f scripts/download-sidecars.sh ]; then
+            bash scripts/download-sidecars.sh
+          else
+            echo "No sidecar download script found; skipping"
+          fi
+
+      - name: Build and bundle app
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target ${{ matrix.rust_target }}
+
+      - name: Collect packaged artifacts
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "release-artifacts/${PLATFORM}"
+          BUNDLE_DIR="src-tauri/target/${RUST_TARGET}/release/bundle"
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            echo "Bundle directory missing: $BUNDLE_DIR" >&2
+            ls -R src-tauri/target/${RUST_TARGET}/release/ || true
+            exit 1
+          fi
+          # Copy all bundle output (nsis/*, app/*, dmg/*, msi/*) flattening
+          # each format's files into the platform directory. The release job
+          # picks specific patterns from here.
+          find "$BUNDLE_DIR" -type f \( \
+            -name "*.exe" -o \
+            -name "*.nsis.zip" -o \
+            -name "*.nsis.zip.sig" -o \
+            -name "*.msi" -o \
+            -name "*.msi.zip" -o \
+            -name "*.msi.zip.sig" -o \
+            -name "*.app.tar.gz" -o \
+            -name "*.app.tar.gz.sig" -o \
+            -name "*.dmg" \
+          \) -exec cp {} "release-artifacts/${PLATFORM}/" \;
+          echo "Collected artifacts:"
+          ls -la "release-artifacts/${PLATFORM}/"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: release-artifacts/${{ matrix.platform }}
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Generate latest.json manifest
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import pathlib
+
+          root = pathlib.Path("release-artifacts")
+          repo = os.environ["REPO"]
+          version = os.environ["VERSION"]
+          tag_name = os.environ["TAG_NAME"]
+
+          # Tauri updater platform keys:
+          #   windows-x86_64 -> NSIS .exe bundled in .nsis.zip
+          #   windows-aarch64 -> NSIS .exe bundled in .nsis.zip
+          #   darwin-aarch64 -> .app.tar.gz
+          required_platforms = {
+              "windows-x86_64": {
+                  "artifact_dir": "windows-x86_64",
+                  "updater_pattern": "*.nsis.zip",
+                  "tauri_target": "windows-x86_64",
+              },
+              "windows-aarch64": {
+                  "artifact_dir": "windows-aarch64",
+                  "updater_pattern": "*.nsis.zip",
+                  "tauri_target": "windows-aarch64",
+              },
+              "darwin-aarch64": {
+                  "artifact_dir": "macos-aarch64",
+                  "updater_pattern": "*.app.tar.gz",
+                  "tauri_target": "darwin-aarch64",
+              },
+          }
+
+          def pick_single_asset(directory: pathlib.Path, pattern: str, label: str) -> pathlib.Path:
+              matches = sorted(directory.glob(pattern))
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Expected exactly one {label} matching {pattern!r} in {directory}, "
+                      f"found {len(matches)}: {[m.name for m in matches]}"
+                  )
+              return matches[0]
+
+          def read_signature(path: pathlib.Path) -> str:
+              if not path.is_file():
+                  raise SystemExit(f"Missing updater signature: {path}")
+              signature = path.read_text(encoding="utf-8").strip()
+              if not signature:
+                  raise SystemExit(f"Updater signature is empty: {path}")
+              return signature
+
+          platforms = {}
+          for tauri_key, metadata in required_platforms.items():
+              directory = root / metadata["artifact_dir"]
+              if not directory.is_dir():
+                  raise SystemExit(
+                      f"Missing packaged artifacts for {tauri_key}: {directory}"
+                  )
+              asset = pick_single_asset(
+                  directory,
+                  metadata["updater_pattern"],
+                  f"{tauri_key} updater asset",
+              )
+              signature = read_signature(pathlib.Path(f"{asset}.sig"))
+              platforms[tauri_key] = {
+                  "signature": signature,
+                  "url": f"https://github.com/{repo}/releases/download/{tag_name}/{asset.name}",
+              }
+
+          manifest = {
+              "version": version,
+              "notes": "See the GitHub release notes for details.",
+              "pub_date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+              "platforms": platforms,
+          }
+          pathlib.Path("latest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print("Generated latest.json:")
+          print(pathlib.Path("latest.json").read_text(encoding="utf-8"))
+          PY
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag_name }}
+          name: Prosper Together ${{ needs.prepare.outputs.release_version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release-artifacts/windows-x86_64/*
+            release-artifacts/windows-aarch64/*
+            release-artifacts/macos-aarch64/*
+            latest.json

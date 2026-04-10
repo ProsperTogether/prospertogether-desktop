@@ -1,0 +1,50 @@
+# ─── Build artifacts ─────────────────────────────────────────────────────────
+target/
+dist/
+dist-ssr/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+
+# ─── Signing keys (CRITICAL — NEVER commit) ──────────────────────────────────
+# The minisign private key signs update manifests. Loss = no more updates
+# ever for existing installs. Leak = attacker can publish signed fake updates.
+#
+# All signing key material lives under src-tauri/keys/ so there is exactly
+# ONE directory to protect. The whole directory is ignored, not just specific
+# file patterns, so nothing inside can ever be accidentally committed.
+src-tauri/keys/
+src-tauri/.tauri-private.key
+src-tauri/.tauri-private.key.pub
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ─── Environment files ───────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Sidecar binaries (fetched by scripts/download-sidecars.sh) ─────────────
+src-tauri/binaries/*.exe
+src-tauri/binaries/*.dll
+src-tauri/resources/models/*.bin
+
+# ─── Tauri build outputs ─────────────────────────────────────────────────────
+src-tauri/WixTools/
+
+# ─── OS / editor noise ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.log
+
+# ─── Vite / frontend build caches ────────────────────────────────────────────
+.vite/
+*.tsbuildinfo
