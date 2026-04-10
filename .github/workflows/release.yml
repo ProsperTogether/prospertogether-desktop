@@ -192,16 +192,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # v1: Windows x86_64 only. The scripts/download-sidecars.sh hardcodes
+        # `TRIPLE=x86_64-pc-windows-msvc` and pulls Windows .exe/.dll files,
+        # so macOS and Windows-ARM builds would fail at the sidecar step.
+        # Add those platforms back here once the sidecar script is
+        # generalized to fetch the right ffmpeg/whisper binaries per target.
         include:
           - runner: windows-latest
             platform: windows-x86_64
             rust_target: x86_64-pc-windows-msvc
-          - runner: windows-11-arm
-            platform: windows-aarch64
-            rust_target: aarch64-pc-windows-msvc
-          - runner: macos-15
-            platform: macos-aarch64
-            rust_target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -241,27 +240,9 @@ jobs:
         shell: bash
         run: npm ci
 
-      - name: Download sidecar binaries (Windows)
-        if: runner.os == 'Windows'
+      - name: Download sidecar binaries
         shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f scripts/download-sidecars.sh ]; then
-            bash scripts/download-sidecars.sh
-          else
-            echo "No sidecar download script found; skipping"
-          fi
-
-      - name: Download sidecar binaries (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f scripts/download-sidecars.sh ]; then
-            bash scripts/download-sidecars.sh
-          else
-            echo "No sidecar download script found; skipping"
-          fi
+        run: bash scripts/download-sidecars.sh
 
       - name: Build and bundle app
         shell: bash
@@ -338,25 +319,14 @@ jobs:
           version = os.environ["VERSION"]
           tag_name = os.environ["TAG_NAME"]
 
-          # Tauri updater platform keys:
-          #   windows-x86_64 -> NSIS .exe bundled in .nsis.zip
-          #   windows-aarch64 -> NSIS .exe bundled in .nsis.zip
-          #   darwin-aarch64 -> .app.tar.gz
+          # Tauri updater platform keys. v1 ships Windows x86_64 only;
+          # re-add windows-aarch64 / darwin-aarch64 entries here once the
+          # matrix builds them.
           required_platforms = {
               "windows-x86_64": {
                   "artifact_dir": "windows-x86_64",
                   "updater_pattern": "*.nsis.zip",
                   "tauri_target": "windows-x86_64",
-              },
-              "windows-aarch64": {
-                  "artifact_dir": "windows-aarch64",
-                  "updater_pattern": "*.nsis.zip",
-                  "tauri_target": "windows-aarch64",
-              },
-              "darwin-aarch64": {
-                  "artifact_dir": "macos-aarch64",
-                  "updater_pattern": "*.app.tar.gz",
-                  "tauri_target": "darwin-aarch64",
               },
           }
 
@@ -419,6 +389,4 @@ jobs:
           generate_release_notes: true
           files: |
             release-artifacts/windows-x86_64/*
-            release-artifacts/windows-aarch64/*
-            release-artifacts/macos-aarch64/*
             latest.json
