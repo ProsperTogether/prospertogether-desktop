@@ -39,9 +39,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "app", "dmg"],
-    "externalBin": ["binaries/ffmpeg", "binaries/whisper"],
-    "resources": ["resources/models/*", "binaries/*.dll"],
+    "targets": [
+      "nsis",
+      "app",
+      "dmg"
+    ],
+    "externalBin": [
+      "binaries/ffmpeg",
+      "binaries/whisper"
+    ],
+    "resources": [
+      "resources/models/*",
+      "binaries/*.dll"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -64,7 +74,9 @@
     },
     "deep-link": {
       "desktop": {
-        "schemes": ["prospertogether"]
+        "schemes": [
+          "prospertogether"
+        ]
       }
     },
     "shell": {
