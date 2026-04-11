@@ -228,12 +228,15 @@ jobs:
           # which shows up downstream as "Expected exactly one *.nsis.zip,
           # found 0". Better to fail loudly here than debug that in the
           # release job.
-          KEY_HEAD=$(echo "$TAURI_SIGNING_PRIVATE_KEY" | head -c 20)
+          # Extract more chars than the expected prefix length so the
+          # `starts-with` glob match can actually succeed. The expected
+          # prefix is 23 chars, so we grab 40.
+          KEY_HEAD=$(printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | head -c 40)
           EXPECTED_PREFIX="dW50cnVzdGVkIGNvbW1lbnQ6"
           if [[ "$KEY_HEAD" != "$EXPECTED_PREFIX"* ]]; then
             echo "TAURI_SIGNING_PRIVATE_KEY does not start with the expected" >&2
             echo "base64-encoded 'untrusted comment:' header." >&2
-            echo "Actual first 20 chars: '$KEY_HEAD'" >&2
+            echo "Actual first 40 chars: '$KEY_HEAD'" >&2
             echo "Expected to start with: '$EXPECTED_PREFIX'" >&2
             echo "" >&2
             echo "Re-create the secret from src-tauri/keys/tauri-signing.key:" >&2
