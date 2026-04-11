@@ -277,7 +277,63 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- --target ${{ matrix.rust_target }}
+        # --verbose surfaces the tauri bundler's signing pipeline output.
+        # Without it, Tauri silently skips producing the *.nsis.zip updater
+        # archive when signing fails (e.g., wrong password, key decrypt
+        # error) and the build still "succeeds" — leaving us to guess at
+        # the release step.
+        run: npm run tauri build -- --verbose --target ${{ matrix.rust_target }}
+
+      - name: Verify updater archive was produced
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${RUST_TARGET}/release/bundle"
+          NSIS_DIR="$BUNDLE_DIR/nsis"
+
+          echo "=== Full bundle directory tree ==="
+          if [ -d "$BUNDLE_DIR" ]; then
+            find "$BUNDLE_DIR" -type f | sort
+          else
+            echo "Bundle directory missing: $BUNDLE_DIR" >&2
+            exit 1
+          fi
+          echo ""
+
+          # Tauri's bundler silently skips generating the .nsis.zip updater
+          # archive when signing fails. If that happens, we want to fail the
+          # build HERE with a clear diagnosis instead of passing the build
+          # and then confusing the release job with "found 0 .nsis.zip".
+          SHOPT_STATE=$(shopt -p nullglob || true)
+          shopt -s nullglob
+          NSIS_ZIPS=("$NSIS_DIR"/*.nsis.zip)
+          NSIS_SIGS=("$NSIS_DIR"/*.nsis.zip.sig)
+          eval "$SHOPT_STATE" 2>/dev/null || true
+
+          if [ "${#NSIS_ZIPS[@]}" -eq 0 ]; then
+            echo "::error::Tauri bundler did not produce any *.nsis.zip updater archive." >&2
+            echo "" >&2
+            echo "This almost always means the signing step silently failed." >&2
+            echo "Likely causes:" >&2
+            echo "  1. TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret does not match the" >&2
+            echo "     password the key was generated with." >&2
+            echo "  2. TAURI_SIGNING_PRIVATE_KEY was copied with whitespace or escaped" >&2
+            echo "     characters and can't be decoded." >&2
+            echo "  3. tauri.conf.json pubkey does not match the private key." >&2
+            echo "" >&2
+            echo "Check the full Tauri build log above for the real signing error" >&2
+            echo "(look for 'could not sign', 'invalid password', or 'skipped signing')." >&2
+            exit 1
+          fi
+          if [ "${#NSIS_SIGS[@]}" -eq 0 ]; then
+            echo "::error::*.nsis.zip exists but no matching *.nsis.zip.sig was produced." >&2
+            echo "Signing produced the archive but not the signature — this should never happen." >&2
+            exit 1
+          fi
+
+          echo "OK: produced ${#NSIS_ZIPS[@]} .nsis.zip archive(s) and ${#NSIS_SIGS[@]} signature(s)"
 
       - name: Collect packaged artifacts
         shell: bash
@@ -288,25 +344,12 @@ jobs:
           set -euo pipefail
           mkdir -p "release-artifacts/${PLATFORM}"
           BUNDLE_DIR="src-tauri/target/${RUST_TARGET}/release/bundle"
-          if [ ! -d "$BUNDLE_DIR" ]; then
-            echo "Bundle directory missing: $BUNDLE_DIR" >&2
-            ls -R src-tauri/target/${RUST_TARGET}/release/ || true
-            exit 1
-          fi
-
-          echo "=== Full bundle directory tree ==="
-          find "$BUNDLE_DIR" -type f | sort
-          echo ""
 
           # Copy NSIS installer + updater archive + signature.
           # On Windows the bundle layout is:
           #   bundle/nsis/*.exe         (installer)
           #   bundle/nsis/*.nsis.zip    (updater archive, only if signed)
           #   bundle/nsis/*.nsis.zip.sig (signature)
-          # On macOS:
-          #   bundle/macos/*.app.tar.gz (updater archive)
-          #   bundle/macos/*.app.tar.gz.sig
-          #   bundle/dmg/*.dmg
           NSIS_DIR="$BUNDLE_DIR/nsis"
           if [ -d "$NSIS_DIR" ]; then
             echo "=== Copying from $NSIS_DIR ==="
