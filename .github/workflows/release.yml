@@ -213,12 +213,37 @@ jobs:
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             echo "Missing secret: TAURI_SIGNING_PRIVATE_KEY" >&2
             exit 1
           fi
+          # Sanity-check the key format. Tauri's rsign-format keys start with
+          # a base64-encoded "untrusted comment:" header. If the pasted secret
+          # has stray whitespace, quoting, or got truncated, the decrypted
+          # content won't match and Tauri will silently SKIP producing the
+          # .nsis.zip updater archive (leaving only the raw .exe installer),
+          # which shows up downstream as "Expected exactly one *.nsis.zip,
+          # found 0". Better to fail loudly here than debug that in the
+          # release job.
+          KEY_HEAD=$(echo "$TAURI_SIGNING_PRIVATE_KEY" | head -c 20)
+          EXPECTED_PREFIX="dW50cnVzdGVkIGNvbW1lbnQ6"
+          if [[ "$KEY_HEAD" != "$EXPECTED_PREFIX"* ]]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY does not start with the expected" >&2
+            echo "base64-encoded 'untrusted comment:' header." >&2
+            echo "Actual first 20 chars: '$KEY_HEAD'" >&2
+            echo "Expected to start with: '$EXPECTED_PREFIX'" >&2
+            echo "" >&2
+            echo "Re-create the secret from src-tauri/keys/tauri-signing.key:" >&2
+            echo "  Get-Content src-tauri/keys/tauri-signing.key -Raw | Set-Clipboard" >&2
+            exit 1
+          fi
+          echo "Signing key format looks correct (starts with expected header)."
+          # Note: we intentionally do NOT print the length or any content of
+          # the key beyond the public header prefix — the remainder contains
+          # secret material.
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -265,21 +290,31 @@ jobs:
             ls -R src-tauri/target/${RUST_TARGET}/release/ || true
             exit 1
           fi
-          # Copy all bundle output (nsis/*, app/*, dmg/*, msi/*) flattening
-          # each format's files into the platform directory. The release job
-          # picks specific patterns from here.
-          find "$BUNDLE_DIR" -type f \( \
-            -name "*.exe" -o \
-            -name "*.nsis.zip" -o \
-            -name "*.nsis.zip.sig" -o \
-            -name "*.msi" -o \
-            -name "*.msi.zip" -o \
-            -name "*.msi.zip.sig" -o \
-            -name "*.app.tar.gz" -o \
-            -name "*.app.tar.gz.sig" -o \
-            -name "*.dmg" \
-          \) -exec cp {} "release-artifacts/${PLATFORM}/" \;
-          echo "Collected artifacts:"
+
+          echo "=== Full bundle directory tree ==="
+          find "$BUNDLE_DIR" -type f | sort
+          echo ""
+
+          # Copy NSIS installer + updater archive + signature.
+          # On Windows the bundle layout is:
+          #   bundle/nsis/*.exe         (installer)
+          #   bundle/nsis/*.nsis.zip    (updater archive, only if signed)
+          #   bundle/nsis/*.nsis.zip.sig (signature)
+          # On macOS:
+          #   bundle/macos/*.app.tar.gz (updater archive)
+          #   bundle/macos/*.app.tar.gz.sig
+          #   bundle/dmg/*.dmg
+          NSIS_DIR="$BUNDLE_DIR/nsis"
+          if [ -d "$NSIS_DIR" ]; then
+            echo "=== Copying from $NSIS_DIR ==="
+            find "$NSIS_DIR" -maxdepth 1 -type f \( \
+              -name "*.exe" -o \
+              -name "*.nsis.zip" -o \
+              -name "*.nsis.zip.sig" \
+            \) -exec cp -v {} "release-artifacts/${PLATFORM}/" \;
+          fi
+
+          echo "=== Collected artifacts ==="
           ls -la "release-artifacts/${PLATFORM}/"
 
       - name: Upload packaged artifacts
