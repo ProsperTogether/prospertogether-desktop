@@ -6,7 +6,7 @@ const launchRegionPicker = () => {
 };
 
 export const RegionPicker = () => {
-  const { captureTarget, setCaptureTarget } = useRecordingStore();
+  const { captureTarget } = useRecordingStore();
 
   const hasRegion = captureTarget.mode === 'region';
 

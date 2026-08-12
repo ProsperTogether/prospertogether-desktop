@@ -22,7 +22,6 @@ export async function openDockPicker(): Promise<CaptureTarget | null> {
   // Convert physical to logical for window positioning
   const dockXLogical = pos.x / sf;
   const dockYLogical = pos.y / sf;
-  const dockWidthLogical = size.width / sf;
   const dockHeightLogical = size.height / sf;
 
   // Anchor the picker to the left side of the dock (where the target indicator sits)
