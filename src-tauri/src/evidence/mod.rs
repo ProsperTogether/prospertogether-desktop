@@ -12,7 +12,10 @@ pub mod validate;
 pub mod test_support;
 
 pub use export::{export_evidence_bundle, preview_evidence_bundle, ExportRequest};
-pub use index::{load_import_index, register_imported_bundle_id, save_import_index_atomic};
+pub use index::{
+    claim_consumed_receipt_id, load_import_index, register_imported_bundle_id,
+    save_import_index_atomic,
+};
 pub use sign::{sign_manifest, sign_manifest_with_provider, signing_payload};
 pub use types::{
     DeviceIdentity, EvidenceExportResult, EvidenceManifest, EvidenceProposedTask,

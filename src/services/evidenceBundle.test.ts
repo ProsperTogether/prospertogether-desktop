@@ -19,6 +19,7 @@ import {
   mediaRefForBytes,
   registerImportedBundleId,
   signManifest,
+  signingPayload,
   validateEvidenceBundle,
 } from './evidenceBundle';
 import { hmacSha256Hex, sha256Hex, utf8Bytes } from './evidenceCrypto';
@@ -255,6 +256,23 @@ describe('EvidenceBundle v1 fixtures', () => {
     );
     expect(draft).toBeNull();
     expect(report.errors.some((e) => e.code === 'invalid_bundle')).toBe(true);
+  });
+
+  it('uses an explicit null signature in the canonical signing payload', () => {
+    const unsigned = asManifest(minimalFixture);
+    unsigned.signature = null;
+    const payload = signingPayload(unsigned);
+    expect(payload).toContain('"signature":null');
+    expect(payload.indexOf('"signature":null')).toBe(payload.lastIndexOf('"signature":null'));
+  });
+
+  it('fails closed when selected media requires encrypted-object handoff', () => {
+    const manifest = asManifest(minimalFixture);
+    manifest.media[0].protection = 'encryptedObjectHandoffRequired';
+    const bundle = signedBundle(manifest, {});
+    const { draft, report } = createTaskDraftFromBundle(bundle, ctxFor(TEST_IDENTITY, [], false));
+    expect(draft).toBeNull();
+    expect(report.errors.some((e) => e.code === 'encrypted_object_handoff_required')).toBe(true);
   });
 
   it('keeps media hashes separate from the manifest body', () => {

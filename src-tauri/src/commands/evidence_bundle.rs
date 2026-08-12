@@ -220,16 +220,18 @@ fn build_request(
     })
 }
 
-/// Return the enrolled device identity for an explicit Portal enrollment or
-/// attestation flow. The signing key is loaded from OS-protected storage and
-/// is never read from a project/configuration file; callers must not persist
-/// the returned secret.
+/// Return the enrolled public device identity. The HMAC secret stays in
+/// OS-protected storage and is never returned over IPC.
 #[tauri::command]
 pub async fn get_evidence_device_identity(
     app: AppHandle,
     signer: State<'_, SessionSignerState>,
-) -> Result<DeviceIdentity, String> {
-    session_identity(&app, &signer)
+) -> Result<DevicePublicIdentity, String> {
+    let identity = session_identity(&app, &signer)?;
+    Ok(DevicePublicIdentity {
+        device_id: identity.device_id,
+        device_key_id: identity.device_key_id,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,6 +284,12 @@ fn verify_review_receipt(
     receipt: &EvidenceReviewReceipt,
     identity: &DeviceIdentity,
 ) -> Result<(), String> {
+    if receipt.draft.scope != "personal" && receipt.draft.scope != "managed" {
+        return Err("review receipt scope must be personal or managed".into());
+    }
+    if receipt.draft.source_bundle_id != receipt.bundle_id {
+        return Err("review receipt bundle id does not match the draft".into());
+    }
     if receipt.signature.algorithm != ALLOWED_SIG_ALG
         || receipt.signature.key_id != identity.device_key_id
     {
@@ -300,6 +308,9 @@ fn write_receipt_atomic(
     receipt: &EvidenceReviewReceipt,
 ) -> Result<(), String> {
     use std::io::Write;
+    if path.exists() {
+        return Err("review receipt already exists".into());
+    }
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
@@ -316,6 +327,9 @@ fn write_receipt_atomic(
             .map_err(|e| format!("write temporary receipt: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("sync temporary receipt: {e}"))?;
+        if path.exists() {
+            return Err("review receipt already exists".into());
+        }
         std::fs::rename(&temp, path).map_err(|e| format!("install receipt atomically: {e}"))
     })();
     if result.is_err() {
@@ -533,17 +547,15 @@ pub async fn confirm_evidence_review(
     Ok(receipt)
 }
 
-#[tauri::command]
-pub async fn get_evidence_review_receipt(
-    app: AppHandle,
-    signer: State<'_, SessionSignerState>,
-    receipt_id: String,
+fn load_verified_receipt(
+    app: &AppHandle,
+    identity: &DeviceIdentity,
+    receipt_id: &str,
 ) -> Result<EvidenceReviewReceipt, String> {
-    if uuid::Uuid::parse_str(&receipt_id).is_err() {
+    if uuid::Uuid::parse_str(receipt_id).is_err() {
         return Err("invalid receipt id".into());
     }
-    let identity = session_identity(&app, &signer)?;
-    let path = evidence_root(&app)?
+    let path = evidence_root(app)?
         .join("receipts")
         .join(format!("{receipt_id}.json"));
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("receipt not found: {e}"))?;
@@ -552,7 +564,33 @@ pub async fn get_evidence_review_receipt(
     if receipt.receipt_id != receipt_id {
         return Err("receipt id does not match its filename".into());
     }
-    verify_review_receipt(&receipt, &identity)?;
+    verify_review_receipt(&receipt, identity)?;
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub async fn get_evidence_review_receipt(
+    app: AppHandle,
+    signer: State<'_, SessionSignerState>,
+    receipt_id: String,
+) -> Result<EvidenceReviewReceipt, String> {
+    let identity = session_identity(&app, &signer)?;
+    load_verified_receipt(&app, &identity, &receipt_id)
+}
+
+/// Command-authoritative one-time claim for DevManager Connect handoff.
+#[tauri::command]
+pub async fn consume_evidence_review_receipt(
+    app: AppHandle,
+    signer: State<'_, SessionSignerState>,
+    receipt_id: String,
+) -> Result<EvidenceReviewReceipt, String> {
+    let identity = session_identity(&app, &signer)?;
+    let receipt = load_verified_receipt(&app, &identity, &receipt_id)?;
+    let root = evidence_root(&app)?;
+    if !crate::evidence::index::claim_consumed_receipt_id(&root, &receipt_id)? {
+        return Err("review receipt has already been used".into());
+    }
     Ok(receipt)
 }
 
@@ -645,5 +683,27 @@ mod evidence_bundle_tests {
             verify_review_receipt(&receipt, &crate::evidence::test_support::alt_identity())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn receipt_file_and_consume_index_are_duplicate_guarded() {
+        let root = std::env::temp_dir().join(format!("ev-receipt-{}", uuid::Uuid::new_v4()));
+        let identity = crate::evidence::test_support::test_identity();
+        let receipt = receipt(&identity);
+        let path = root
+            .join("receipts")
+            .join(format!("{}.json", receipt.receipt_id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_receipt_atomic(&path, &receipt).unwrap();
+        let overwrite = write_receipt_atomic(&path, &receipt);
+        assert!(overwrite.is_err(), "existing receipt must not be replaced");
+
+        assert!(
+            crate::evidence::index::claim_consumed_receipt_id(&root, &receipt.receipt_id).unwrap()
+        );
+        assert!(
+            !crate::evidence::index::claim_consumed_receipt_id(&root, &receipt.receipt_id).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -21,13 +21,24 @@ const MAX_PROTECTED_BYTES: usize = 16 * 1024;
 const MAX_ID_CHARS: usize = 128;
 const KEY_BYTES: usize = 32;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SecretRecord {
     version: u32,
     device_id: String,
     device_key_id: String,
     hmac_key_hex: String,
+}
+
+impl std::fmt::Debug for SecretRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretRecord")
+            .field("version", &self.version)
+            .field("device_id", &self.device_id)
+            .field("device_key_id", &self.device_key_id)
+            .field("hmac_key_hex", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Load the enrolled identity, or create it once when this device has never
@@ -39,40 +50,24 @@ pub fn load_or_create(
     root: &Path,
     public_identity: Option<&DevicePublicIdentity>,
 ) -> Result<DeviceIdentity, String> {
-    let path = root.join(SECRET_FILENAME);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            if bytes.len() > MAX_PROTECTED_BYTES {
-                return Err("stored evidence identity is too large".into());
+    if let Some(identity) = load_protected(root)? {
+        if let Some(public) = public_identity {
+            if public.device_id != identity.device_id
+                || public.device_key_id != identity.device_key_id
+            {
+                return Err("public evidence identity does not match protected enrollment".into());
             }
-            let plaintext = unprotect(&bytes)?;
-            let record: SecretRecord = serde_json::from_slice(&plaintext)
-                .map_err(|_| "stored evidence identity is corrupt".to_string())?;
-            let identity = record.into_identity()?;
-            if let Some(public) = public_identity {
-                if public.device_id != identity.device_id
-                    || public.device_key_id != identity.device_key_id
-                {
-                    return Err(
-                        "public evidence identity does not match protected enrollment".into(),
-                    );
-                }
-            }
-            return Ok(identity);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!("read protected evidence identity: {error}"));
-        }
-    };
+        return Ok(identity);
+    }
 
-    let public = match public_identity {
-        Some(identity) => {
-            validate_public_identity(identity)?;
-            identity.clone()
-        }
-        None => generate_public_identity(),
-    };
+    if public_identity.is_some() {
+        return Err(
+            "protected evidence identity is missing; refuse to mint a replacement key".into(),
+        );
+    }
+
+    let public = generate_public_identity();
     let key = generate_key_hex();
     let record = SecretRecord {
         version: RECORD_VERSION,
@@ -85,7 +80,7 @@ pub fn load_or_create(
     if encrypted.len() > MAX_PROTECTED_BYTES {
         return Err("protected evidence identity is too large".into());
     }
-    write_new_atomic(&path, &encrypted)?;
+    write_new_atomic(&root.join(SECRET_FILENAME), &encrypted)?;
     Ok(DeviceIdentity {
         device_id: public.device_id,
         device_key_id: public.device_key_id,
@@ -103,6 +98,14 @@ pub fn install_enrollment_secret(
     enrollment_secret_hex: &str,
 ) -> Result<DeviceIdentity, String> {
     validate_public_identity(public_identity)?;
+    let existing = load_protected(root)?.ok_or_else(|| {
+        "protected evidence identity is missing; refuse to enroll a replacement".to_string()
+    })?;
+    if existing.device_id != public_identity.device_id
+        || existing.device_key_id != public_identity.device_key_id
+    {
+        return Err("Portal enrollment identity does not match this device".into());
+    }
     let key = hex_decode(enrollment_secret_hex)
         .map_err(|_| "Portal enrollment secret is not valid hex".to_string())?;
     if key.len() != KEY_BYTES {
@@ -151,6 +154,23 @@ impl SecretRecord {
     }
 }
 
+fn load_protected(root: &Path) -> Result<Option<DeviceIdentity>, String> {
+    let path = root.join(SECRET_FILENAME);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.len() > MAX_PROTECTED_BYTES {
+                return Err("stored evidence identity is too large".into());
+            }
+            let plaintext = unprotect(&bytes)?;
+            let record: SecretRecord = serde_json::from_slice(&plaintext)
+                .map_err(|_| "stored evidence identity is corrupt".to_string())?;
+            Ok(Some(record.into_identity()?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read protected evidence identity: {error}")),
+    }
+}
+
 fn validate_public_identity(identity: &DevicePublicIdentity) -> Result<(), String> {
     for (label, value) in [
         ("device_id", identity.device_id.as_str()),
@@ -194,6 +214,7 @@ fn generate_key_hex() -> String {
 }
 
 fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::fs::OpenOptions;
     use std::io::Write;
 
     let parent = path
@@ -201,19 +222,25 @@ fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .ok_or_else(|| "protected evidence identity has no parent".to_string())?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("create evidence identity directory: {e}"))?;
-    let temporary = parent.join(format!(".{}.{}.tmp", SECRET_FILENAME, uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "protected evidence identity already exists".into()
+            } else {
+                format!("create protected evidence identity: {error}")
+            }
+        })?;
     let result = (|| {
-        let mut file = std::fs::File::create(&temporary)
-            .map_err(|e| format!("create protected evidence identity: {e}"))?;
         file.write_all(bytes)
             .map_err(|e| format!("write protected evidence identity: {e}"))?;
         file.sync_all()
-            .map_err(|e| format!("sync protected evidence identity: {e}"))?;
-        std::fs::rename(&temporary, path)
-            .map_err(|e| format!("install protected evidence identity: {e}"))
+            .map_err(|e| format!("sync protected evidence identity: {e}"))
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(path);
     }
     result
 }
@@ -385,6 +412,42 @@ mod tests {
         };
         let error = load_or_create(&root, Some(&wrong)).expect_err("mismatch must fail closed");
         assert!(error.contains("does not match"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_to_mint_a_replacement_key_when_public_identity_exists_without_protected_record() {
+        let root =
+            std::env::temp_dir().join(format!("devagent-evidence-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let public = DevicePublicIdentity {
+            device_id: "devagent-existing".into(),
+            device_key_id: "key-existing".into(),
+        };
+        let error = load_or_create(&root, Some(&public))
+            .expect_err("missing protected record must not mint a replacement key");
+        assert!(error.contains("missing") || error.contains("refuse"));
+        assert!(!root.join(SECRET_FILENAME).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enrollment_refuses_a_mismatched_or_replacing_identity() {
+        let root =
+            std::env::temp_dir().join(format!("devagent-evidence-key-{}", uuid::Uuid::new_v4()));
+        let first = load_or_create(&root, None).expect("first identity should be created");
+        let mismatched = DevicePublicIdentity {
+            device_id: "devagent-other".into(),
+            device_key_id: first.device_key_id.clone(),
+        };
+        let error = install_enrollment_secret(&root, &mismatched, &"cd".repeat(KEY_BYTES))
+            .expect_err("mismatched enrollment must fail closed");
+        assert!(error.contains("match") || error.contains("identity"));
+
+        let reloaded = load_or_create(&root, None).expect("original identity must remain");
+        assert_eq!(reloaded.device_id, first.device_id);
+        assert_eq!(reloaded.device_key_id, first.device_key_id);
+        assert_eq!(reloaded.hmac_key_hex, first.hmac_key_hex);
         let _ = std::fs::remove_dir_all(root);
     }
 

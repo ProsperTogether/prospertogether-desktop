@@ -1029,6 +1029,18 @@ mod evidence_bundle {
     }
 
     #[test]
+    fn selected_encrypted_handoff_media_fails_closed() {
+        let identity = test_identity();
+        let mut manifest = load_fixture("minimal.json");
+        manifest.media[0].protection = PROTECTION_ENCRYPTED_HANDOFF.into();
+        let manifest = sign_manifest(&manifest, &identity, "2026-08-11T19:01:00.000Z").unwrap();
+        let ctx = ctx_for(&identity);
+        let (draft, report) = create_task_draft(&manifest, &ctx, "personal", None, None);
+        assert!(draft.is_none());
+        assert!(report.has_code("encrypted_object_handoff_required"));
+    }
+
+    #[test]
     fn accepts_full_fixture_with_separate_media() {
         let identity = fixture_identity("dev-fixture-2", "key-fixture-2", "33");
         let manifest = signed("full.json", &identity);

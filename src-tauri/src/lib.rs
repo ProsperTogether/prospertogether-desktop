@@ -87,6 +87,7 @@ pub fn run() {
             commands::evidence_bundle::validate_evidence_bundle,
             commands::evidence_bundle::confirm_evidence_review,
             commands::evidence_bundle::get_evidence_review_receipt,
+            commands::evidence_bundle::consume_evidence_review_receipt,
             commands::evidence_bundle::import_evidence_bundle,
         ])
         .setup(|app| {

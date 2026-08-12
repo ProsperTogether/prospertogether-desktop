@@ -54,6 +54,7 @@ pub fn unsigned_value(bundle: &Value) -> Result<Value, String> {
             next.insert(k.clone(), v.clone());
         }
     }
+    next.insert("signature".into(), Value::Null);
     Ok(Value::Object(next))
 }
 

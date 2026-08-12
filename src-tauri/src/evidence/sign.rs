@@ -44,3 +44,27 @@ pub fn sign_manifest(
     };
     sign_manifest_with_provider(bundle, &signer, signed_at)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evidence::test_support::{load_fixture, test_identity};
+
+    #[test]
+    fn signing_payload_keeps_explicit_null_signature() {
+        let identity = test_identity();
+        let manifest = sign_manifest(
+            &load_fixture("minimal.json"),
+            &identity,
+            "2026-08-11T19:01:00.000Z",
+        )
+        .unwrap();
+        let payload = signing_payload(&manifest).unwrap();
+        assert!(payload.contains("\"signature\":null"));
+        assert_eq!(
+            payload.matches("\"signature\":null").count(),
+            1,
+            "canonical payload must contain exactly one explicit null signature"
+        );
+    }
+}

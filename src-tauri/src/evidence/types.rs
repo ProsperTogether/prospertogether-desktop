@@ -198,14 +198,22 @@ pub struct DevicePublicIdentity {
 }
 
 /// Signing material loaded into memory from OS-protected storage. The key is
-/// serialized only for the explicit enrollment bridge; it is never persisted
-/// as plaintext by the app.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// never serialized into IPC, logs, manifests, or project/config files.
+#[derive(Clone)]
 pub struct DeviceIdentity {
     pub device_id: String,
     pub device_key_id: String,
     pub hmac_key_hex: String,
+}
+
+impl std::fmt::Debug for DeviceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceIdentity")
+            .field("device_id", &self.device_id)
+            .field("device_key_id", &self.device_key_id)
+            .field("hmac_key_hex", &"[redacted]")
+            .finish()
+    }
 }
 
 pub trait SignerProvider: Send + Sync {
