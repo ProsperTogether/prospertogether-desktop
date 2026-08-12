@@ -4,10 +4,6 @@ import { invoke } from '@tauri-apps/api/core';
 
 import { createSubmission } from '../../api/submissions';
 import { getRecording, type RecordingDetail } from '../../api/recordings';
-import {
-  buildDevManagerConnectEnvelope,
-  toAgentSubmissionFromEnvelope,
-} from '../../services/devManagerConnect';
 import type { EvidenceReviewReceipt } from '../../types/evidenceBundle';
 
 const PRIORITIES = [
@@ -147,27 +143,28 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
     setError(null);
 
     try {
-      if (receipt) {
-        const envelope = buildDevManagerConnectEnvelope(receipt);
-        await invoke('consume_evidence_review_receipt', {
-          receiptId: envelope.evidenceReceiptId,
-        });
-        await createSubmission(
-          toAgentSubmissionFromEnvelope(envelope, {
-            title: title.trim(),
-            description: description.trim() || undefined,
-            priority,
-            recordingId: recordingId ?? undefined,
-          }),
-        );
-      } else {
-        await createSubmission({
-          title: title.trim(),
-          description: description.trim() || undefined,
-          priority,
-          recordingId: recordingId ?? undefined,
-        });
-      }
+      await createSubmission({
+        title: title.trim(),
+        description: description.trim() || undefined,
+        priority,
+        recordingId: recordingId ?? undefined,
+        evidenceReceiptId: receipt?.receiptId,
+        evidenceBundleId: receipt?.bundleId,
+        evidenceDraft: receipt
+          ? {
+              sourceBundleId: receipt.draft.sourceBundleId,
+              title: receipt.draft.title,
+              summary: receipt.draft.summary,
+              acceptanceCriteria: receipt.draft.acceptanceCriteria,
+              steps: receipt.draft.steps,
+              selectedMediaIds: receipt.draft.selectedMediaIds,
+              selectedTranscriptIds: receipt.draft.selectedTranscriptIds,
+              scope: receipt.draft.scope,
+              projectWorkspace: receipt.draft.projectWorkspace,
+              provider: receipt.draft.provider,
+            }
+          : undefined,
+      });
       navigate('/');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit');

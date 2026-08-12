@@ -13,7 +13,7 @@ export interface AgentSubmission {
   };
 }
 
-export interface CreateAgentSubmissionRequest {
+export const createSubmission = async (data: {
   title: string;
   description?: string;
   priority?: string;
@@ -33,9 +33,7 @@ export interface CreateAgentSubmissionRequest {
     projectWorkspace?: string | null;
     provider?: string | null;
   };
-}
-
-export const createSubmission = async (data: CreateAgentSubmissionRequest) => {
+}) => {
   const res = await api.post('/agent/submissions', data);
   return res.data as AgentSubmission;
 };

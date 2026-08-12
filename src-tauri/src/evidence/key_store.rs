@@ -131,6 +131,23 @@ pub fn install_enrollment_secret(
     Ok(identity)
 }
 
+fn load_protected(root: &Path) -> Result<Option<DeviceIdentity>, String> {
+    let path = root.join(SECRET_FILENAME);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.len() > MAX_PROTECTED_BYTES {
+                return Err("stored evidence identity is too large".into());
+            }
+            let plaintext = unprotect(&bytes)?;
+            let record: SecretRecord = serde_json::from_slice(&plaintext)
+                .map_err(|_| "stored evidence identity is corrupt".to_string())?;
+            Ok(Some(record.into_identity()?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read protected evidence identity: {error}")),
+    }
+}
+
 impl SecretRecord {
     fn into_identity(self) -> Result<DeviceIdentity, String> {
         if self.version != RECORD_VERSION {
@@ -151,23 +168,6 @@ impl SecretRecord {
             device_key_id: public.device_key_id,
             hmac_key_hex: hex_encode(&key),
         })
-    }
-}
-
-fn load_protected(root: &Path) -> Result<Option<DeviceIdentity>, String> {
-    let path = root.join(SECRET_FILENAME);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            if bytes.len() > MAX_PROTECTED_BYTES {
-                return Err("stored evidence identity is too large".into());
-            }
-            let plaintext = unprotect(&bytes)?;
-            let record: SecretRecord = serde_json::from_slice(&plaintext)
-                .map_err(|_| "stored evidence identity is corrupt".to_string())?;
-            Ok(Some(record.into_identity()?))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("read protected evidence identity: {error}")),
     }
 }
 

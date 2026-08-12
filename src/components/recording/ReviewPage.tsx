@@ -4,7 +4,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 
 import { EvidenceReviewPanel } from './EvidenceReviewPanel';
 import { useEvidenceReview } from '../../hooks/useEvidenceReview';
-import { recordingEvidenceHandoffQuery } from '../../services/devManagerConnect';
+import { useSubmitRecording, type SubmitStage } from '../../hooks/useSubmitRecording';
 import type { RecordingMeta } from '../../types/recording';
 
 function formatDuration(seconds: number): string {
@@ -50,6 +50,23 @@ function captureTargetLabel(target: RecordingMeta['capture_target']): string {
   }
 }
 
+function stageLabel(stage: SubmitStage): string {
+  switch (stage) {
+    case 'transcribing':
+      return 'Transcribing audio…';
+    case 'keyframes':
+      return 'Extracting keyframes…';
+    case 'uploading':
+      return 'Uploading to server…';
+    case 'success':
+      return 'Upload complete';
+    case 'error':
+      return 'Upload failed';
+    default:
+      return '';
+  }
+}
+
 export const ReviewPage = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -57,11 +74,12 @@ export const ReviewPage = () => {
   const [meta, setMeta] = useState<RecordingMeta | null>(null);
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [handoffError, setHandoffError] = useState<string | null>(null);
 
+  const { stage, error: submitError, submit } = useSubmitRecording();
   const evidence = useEvidenceReview(id);
+  const uploadBusy = stage !== 'idle' && stage !== 'error' && stage !== 'success';
   const evidenceBusy = evidence.busy;
-  const controlsLocked = evidenceBusy;
+  const controlsLocked = uploadBusy || evidenceBusy;
 
   useEffect(() => {
     if (!id) return;
@@ -86,19 +104,25 @@ export const ReviewPage = () => {
 
   const handleContinueToTask = useCallback(() => {
     if (!evidence.canCreateTask || !evidence.receipt) return;
-    const params = recordingEvidenceHandoffQuery(evidence.receipt, meta?.id);
+    const params = new URLSearchParams({
+      evidenceReceiptId: evidence.receipt.receiptId,
+      evidenceBundleId: evidence.receipt.bundleId,
+    });
+    if (meta) params.set('recordingId', meta.id);
     navigate(`/submit?${params.toString()}`);
   }, [evidence.canCreateTask, evidence.receipt, meta, navigate]);
 
-  const handleSubmit = useCallback(() => {
-    if (controlsLocked) return;
-    if (!evidence.canCreateTask || !evidence.receipt) {
-      setHandoffError('Confirm privacy review before creating a task');
-      return;
+  const handleSubmit = useCallback(async () => {
+    if (!meta || controlsLocked) return;
+    const result = await submit(meta.id, meta.duration_seconds);
+    if (result.success) {
+      if (result.serverRecordingId) {
+        navigate(`/submit?recordingId=${result.serverRecordingId}`);
+      } else {
+        navigate('/submit');
+      }
     }
-    setHandoffError(null);
-    handleContinueToTask();
-  }, [controlsLocked, evidence.canCreateTask, evidence.receipt, handleContinueToTask]);
+  }, [meta, submit, navigate, controlsLocked]);
 
   const handleRecordAgain = useCallback(async () => {
     if (!meta || controlsLocked) return;
@@ -160,9 +184,9 @@ export const ReviewPage = () => {
           Watch your capture before sending it in.
         </p>
 
-        {handoffError && (
+        {submitError && (
           <div className="rounded-lg bg-red-50 border border-red-100 px-3.5 py-2.5 mb-4">
-            <p className="text-[13px] text-red-600">{handoffError}</p>
+            <p className="text-[13px] text-red-600">Upload failed: {submitError}</p>
           </div>
         )}
 
@@ -205,6 +229,13 @@ export const ReviewPage = () => {
           </div>
         </div>
 
+        {uploadBusy && (
+          <div className="rounded-lg bg-blue-50 border border-blue-100 px-3.5 py-2.5 mb-4 flex items-center gap-3">
+            <div className="w-4 h-4 border-2 border-blue-300 border-t-blue-600 rounded-full animate-spin" />
+            <p className="text-[13px] text-blue-700">{stageLabel(stage)}</p>
+          </div>
+        )}
+
         <EvidenceReviewPanel
           gate={evidence.gate}
           proposedTask={evidence.proposedTask}
@@ -228,10 +259,10 @@ export const ReviewPage = () => {
         <div className="flex flex-col gap-2">
           <button
             onClick={handleSubmit}
-            disabled={controlsLocked || !evidence.canCreateTask}
+            disabled={controlsLocked}
             className="w-full px-6 py-3 bg-gradient-to-b from-red-500 to-red-600 text-white text-[15px] font-semibold rounded-xl hover:from-red-600 hover:to-red-700 shadow-lg shadow-red-500/25 transition disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Create task from reviewed evidence
+            Submit
           </button>
           <div className="grid grid-cols-2 gap-2">
             <button
