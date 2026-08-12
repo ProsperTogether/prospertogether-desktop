@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { invoke } from '@tauri-apps/api/core';
 
 import { createSubmission } from '../../api/submissions';
 import { getRecording, type RecordingDetail } from '../../api/recordings';
+import type { EvidenceReviewReceipt } from '../../types/evidenceBundle';
 
 const PRIORITIES = [
   { value: 'low', label: 'Low', dot: 'bg-slate-400' },
@@ -32,18 +34,57 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const recordingId = propRecordingId ?? searchParams.get('recordingId');
+  const evidenceReceiptId = searchParams.get('evidenceReceiptId');
+  const evidenceBundleIdHint = searchParams.get('evidenceBundleId');
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState('medium');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [receipt, setReceipt] = useState<EvidenceReviewReceipt | null>(null);
+  const [receiptError, setReceiptError] = useState<string | null>(null);
+  const [receiptLoading, setReceiptLoading] = useState(Boolean(evidenceReceiptId));
 
   const [recording, setRecording] = useState<RecordingDetail | null>(null);
   const [recordingError, setRecordingError] = useState<string | null>(null);
-  // Track whether the user has manually edited any field, so polling does not clobber edits.
   const userEditedRef = useRef({ title: false, description: false, priority: false });
 
-  // Fetch + poll the recording until aiAnalysisStatus reaches a terminal state.
+  useEffect(() => {
+    if (!evidenceReceiptId) {
+      setReceipt(null);
+      setReceiptError(null);
+      setReceiptLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setReceiptLoading(true);
+    (async () => {
+      try {
+        const loaded = await invoke<EvidenceReviewReceipt>('get_evidence_review_receipt', {
+          receiptId: evidenceReceiptId,
+        });
+        if (cancelled) return;
+        setReceipt(loaded);
+        setReceiptError(null);
+        if (!userEditedRef.current.title && loaded.draft.title) {
+          setTitle(loaded.draft.title);
+        }
+        if (!userEditedRef.current.description && loaded.draft.summary) {
+          setDescription(loaded.draft.summary);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setReceipt(null);
+        setReceiptError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setReceiptLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [evidenceReceiptId]);
+
   useEffect(() => {
     if (!recordingId) return;
     let cancelled = false;
@@ -56,20 +97,18 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
         setRecording(data);
         setRecordingError(null);
 
-        // Auto-fill form fields from the AI analysis ONCE (only if user hasn't edited).
         if (data.aiAnalysisStatus === 'completed' && data.aiAnalysis) {
-          if (!userEditedRef.current.title && data.aiAnalysis.suggestedTitle) {
-            setTitle(prev => (prev ? prev : data.aiAnalysis!.suggestedTitle));
+          if (!userEditedRef.current.title && data.aiAnalysis.suggestedTitle && !receipt) {
+            setTitle((prev) => (prev ? prev : data.aiAnalysis!.suggestedTitle));
           }
-          if (!userEditedRef.current.description && data.aiAnalysis.suggestedDescription) {
-            setDescription(prev => (prev ? prev : data.aiAnalysis!.suggestedDescription));
+          if (!userEditedRef.current.description && data.aiAnalysis.suggestedDescription && !receipt) {
+            setDescription((prev) => (prev ? prev : data.aiAnalysis!.suggestedDescription));
           }
           if (!userEditedRef.current.priority && data.aiAnalysis.suggestedPriority) {
-            setPriority(prev => (prev !== 'medium' ? prev : data.aiAnalysis!.suggestedPriority));
+            setPriority((prev) => (prev !== 'medium' ? prev : data.aiAnalysis!.suggestedPriority));
           }
         }
 
-        // Continue polling while we're waiting for analysis to complete.
         const status = data.aiAnalysisStatus;
         if (status === 'pending' || status === 'processing') {
           timeoutId = window.setTimeout(tick, 2500);
@@ -77,7 +116,6 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
       } catch (err) {
         if (cancelled) return;
         setRecordingError(err instanceof Error ? err.message : String(err));
-        // Retry after a short delay so transient network issues don't permanently break.
         timeoutId = window.setTimeout(tick, 5000);
       }
     };
@@ -87,11 +125,19 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
       cancelled = true;
       if (timeoutId) window.clearTimeout(timeoutId);
     };
-  }, [recordingId]);
+  }, [recordingId, receipt]);
+
+  const evidenceFlowRequired = Boolean(evidenceReceiptId || evidenceBundleIdHint);
+  const evidenceReady = Boolean(receipt && !receiptError);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!title.trim()) return;
+    if (!title.trim() || submitting || receiptLoading) return;
+
+    if (evidenceFlowRequired && !evidenceReady) {
+      setError('A command-signed evidence review receipt is required before creating a task');
+      return;
+    }
 
     setSubmitting(true);
     setError(null);
@@ -102,6 +148,22 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
         description: description.trim() || undefined,
         priority,
         recordingId: recordingId ?? undefined,
+        evidenceReceiptId: receipt?.receiptId,
+        evidenceBundleId: receipt?.bundleId,
+        evidenceDraft: receipt
+          ? {
+              sourceBundleId: receipt.draft.sourceBundleId,
+              title: receipt.draft.title,
+              summary: receipt.draft.summary,
+              acceptanceCriteria: receipt.draft.acceptanceCriteria,
+              steps: receipt.draft.steps,
+              selectedMediaIds: receipt.draft.selectedMediaIds,
+              selectedTranscriptIds: receipt.draft.selectedTranscriptIds,
+              scope: receipt.draft.scope,
+              projectWorkspace: receipt.draft.projectWorkspace,
+              provider: receipt.draft.provider,
+            }
+          : undefined,
       });
       navigate('/');
     } catch (err) {
@@ -113,15 +175,32 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
 
   const aiStatus = recording?.aiAnalysisStatus ?? null;
   const aiAnalysis = recording?.aiAnalysis ?? null;
+  const submitBlocked =
+    submitting || !title.trim() || receiptLoading || (evidenceFlowRequired && !evidenceReady);
 
   return (
     <div className="p-5 max-w-3xl mx-auto">
       <div className="mb-5">
         <h1 className="text-lg font-semibold text-slate-900">New Submission</h1>
         <p className="text-[13px] text-slate-500 mt-0.5">Describe a feature request or bug report</p>
+        {evidenceFlowRequired && receiptLoading && (
+          <p className="text-[13px] text-slate-500 mt-2">Loading evidence review receipt…</p>
+        )}
+        {evidenceFlowRequired && receiptError && (
+          <p className="text-[13px] text-red-600 mt-2">
+            Evidence review receipt required and missing: {receiptError}
+          </p>
+        )}
+        {receipt && (
+          <p className="text-[12px] text-slate-500 mt-2">
+            Evidence receipt {receipt.receiptId} for bundle {receipt.bundleId} (
+            {receipt.draft.scope}
+            {receipt.draft.projectWorkspace ? ` · ${receipt.draft.projectWorkspace}` : ''}
+            {receipt.draft.provider ? ` · ${receipt.draft.provider}` : ''}).
+          </p>
+        )}
       </div>
 
-      {/* AI Scope of Work panel */}
       {recordingId && (
         <div className="mb-4 bg-white rounded-2xl shadow-sm ring-1 ring-slate-900/5 overflow-hidden">
           <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between">
@@ -133,9 +212,7 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
               {aiStatus === 'failed' && <StatusPill tone="red" label="Failed" />}
               {aiStatus === 'skipped' && <StatusPill tone="slate" label="Skipped" />}
             </div>
-            {aiStatus === 'completed' && recording && (
-              <CostFooter recording={recording} />
-            )}
+            {aiStatus === 'completed' && recording && <CostFooter recording={recording} />}
           </div>
 
           {aiStatus === 'failed' && recording?.aiAnalysisError && (
@@ -176,12 +253,19 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
                       <li key={i} className="border border-slate-200 rounded-lg px-3 py-2.5 bg-slate-50/50">
                         <div className="flex items-start justify-between gap-2">
                           <div className="text-[13px] font-medium text-slate-800">{c.title}</div>
-                          <span className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-semibold ${
-                            c.changeType === 'bug' ? 'bg-red-100 text-red-700'
-                            : c.changeType === 'feature' ? 'bg-blue-100 text-blue-700'
-                            : c.changeType === 'enhancement' ? 'bg-emerald-100 text-emerald-700'
-                            : 'bg-slate-100 text-slate-700'
-                          }`}>{c.changeType}</span>
+                          <span
+                            className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-semibold ${
+                              c.changeType === 'bug'
+                                ? 'bg-red-100 text-red-700'
+                                : c.changeType === 'feature'
+                                  ? 'bg-blue-100 text-blue-700'
+                                  : c.changeType === 'enhancement'
+                                    ? 'bg-emerald-100 text-emerald-700'
+                                    : 'bg-slate-100 text-slate-700'
+                            }`}
+                          >
+                            {c.changeType}
+                          </span>
                         </div>
                         <p className="text-[12px] text-slate-600 mt-1">{c.description}</p>
                         {c.affectedArea && (
@@ -223,7 +307,11 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
         {recordingId && (
           <div className="flex items-center gap-2.5 text-[13px] text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-xl px-3.5 py-2.5">
             <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25h-9A2.25 2.25 0 0 0 2.25 7.5v9a2.25 2.25 0 0 0 2.25 2.25Z" />
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25h-9A2.25 2.25 0 0 0 2.25 7.5v9a2.25 2.25 0 0 0 2.25 2.25Z"
+              />
             </svg>
             Recording attached
           </div>
@@ -292,7 +380,7 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
         <div className="flex gap-2.5 pt-1">
           <button
             type="submit"
-            disabled={submitting || !title.trim()}
+            disabled={submitBlocked}
             className="flex-1 px-4 py-2.5 bg-gradient-to-b from-brand-500 to-brand-600 text-white text-sm font-medium rounded-lg hover:from-brand-600 hover:to-brand-700 disabled:opacity-50 shadow-sm shadow-brand-600/25 transition"
           >
             {submitting ? 'Submitting...' : 'Submit'}
@@ -310,7 +398,15 @@ export const SubmitPage = ({ recordingId: propRecordingId }: SubmitPageProps) =>
   );
 };
 
-function StatusPill({ tone, label, spin }: { tone: 'blue' | 'emerald' | 'red' | 'slate'; label: string; spin?: boolean }) {
+function StatusPill({
+  tone,
+  label,
+  spin,
+}: {
+  tone: 'blue' | 'emerald' | 'red' | 'slate';
+  label: string;
+  spin?: boolean;
+}) {
   const cls = {
     blue: 'bg-blue-50 text-blue-700 border-blue-200',
     emerald: 'bg-emerald-50 text-emerald-700 border-emerald-200',

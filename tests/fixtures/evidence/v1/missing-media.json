@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "evidence-bundle.v1",
+  "bundleId": "66666666-6666-4666-8666-666666666666",
+  "exportedAt": "2026-08-11T19:00:00.000Z",
+  "timeRange": {
+    "startedAt": "2026-08-11T18:55:00.000Z",
+    "endedAt": "2026-08-11T19:00:00.000Z",
+    "timeZone": "UTC"
+  },
+  "source": {
+    "deviceId": "dev-fixture-1",
+    "deviceKeyId": "key-fixture-1",
+    "userId": null,
+    "displayName": null
+  },
+  "transcriptSegments": [],
+  "media": [
+    {
+      "id": "media-missing",
+      "kind": "recording",
+      "artifactId": "art-missing",
+      "relativePath": "missing.webm",
+      "contentHash": {
+        "algorithm": "sha256",
+        "hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "mimeType": "video/webm",
+      "byteLength": 0,
+      "fileName": "missing.webm",
+      "protection": "none"
+    }
+  ],
+  "windows": [
+    {
+      "title": null,
+      "application": null,
+      "bounds": null,
+      "captureMode": "screen"
+    }
+  ],
+  "proposedTask": {
+    "title": "Captured session",
+    "summary": "Minimal evidence bundle",
+    "acceptanceCriteria": [],
+    "steps": []
+  },
+  "privacyLabels": [
+    "internal_only"
+  ],
+  "redactions": [],
+  "review": {
+    "privacyReviewed": true,
+    "reviewedAt": "2026-08-11T19:00:00.000Z",
+    "reviewerUserId": "user-1"
+  },
+  "signature": null
+}

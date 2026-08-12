@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 
+import { EvidenceReviewPanel } from './EvidenceReviewPanel';
+import { useEvidenceReview } from '../../hooks/useEvidenceReview';
 import { useSubmitRecording, type SubmitStage } from '../../hooks/useSubmitRecording';
 import type { RecordingMeta } from '../../types/recording';
 
@@ -74,9 +76,11 @@ export const ReviewPage = () => {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const { stage, error: submitError, submit } = useSubmitRecording();
-  const busy = stage !== 'idle' && stage !== 'error' && stage !== 'success';
+  const evidence = useEvidenceReview(id);
+  const uploadBusy = stage !== 'idle' && stage !== 'error' && stage !== 'success';
+  const evidenceBusy = evidence.busy;
+  const controlsLocked = uploadBusy || evidenceBusy;
 
-  // Load metadata + video src on mount or when id changes.
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
@@ -98,8 +102,18 @@ export const ReviewPage = () => {
     };
   }, [id]);
 
+  const handleContinueToTask = useCallback(() => {
+    if (!evidence.canCreateTask || !evidence.receipt) return;
+    const params = new URLSearchParams({
+      evidenceReceiptId: evidence.receipt.receiptId,
+      evidenceBundleId: evidence.receipt.bundleId,
+    });
+    if (meta) params.set('recordingId', meta.id);
+    navigate(`/submit?${params.toString()}`);
+  }, [evidence.canCreateTask, evidence.receipt, meta, navigate]);
+
   const handleSubmit = useCallback(async () => {
-    if (!meta) return;
+    if (!meta || controlsLocked) return;
     const result = await submit(meta.id, meta.duration_seconds);
     if (result.success) {
       if (result.serverRecordingId) {
@@ -108,11 +122,10 @@ export const ReviewPage = () => {
         navigate('/submit');
       }
     }
-    // On failure, stay on this page — error banner is rendered below.
-  }, [meta, submit, navigate]);
+  }, [meta, submit, navigate, controlsLocked]);
 
   const handleRecordAgain = useCallback(async () => {
-    if (!meta) return;
+    if (!meta || controlsLocked) return;
     const ok = window.confirm('Delete this recording and start a new one?');
     if (!ok) return;
     try {
@@ -121,10 +134,10 @@ export const ReviewPage = () => {
       console.warn('[ReviewPage] delete failed:', err);
     }
     navigate('/record');
-  }, [meta, navigate]);
+  }, [meta, navigate, controlsLocked]);
 
   const handleDelete = useCallback(async () => {
-    if (!meta) return;
+    if (!meta || controlsLocked) return;
     const ok = window.confirm('Delete this recording? This cannot be undone.');
     if (!ok) return;
     try {
@@ -132,14 +145,13 @@ export const ReviewPage = () => {
     } catch (err) {
       console.warn('[ReviewPage] delete failed:', err);
     }
-    // Go to recordings list if there may be other pending; dashboard if empty.
     try {
       const remaining = await invoke<RecordingMeta[]>('list_pending_recordings');
       navigate(remaining.length > 0 ? '/recordings' : '/');
     } catch {
       navigate('/');
     }
-  }, [meta, navigate]);
+  }, [meta, navigate, controlsLocked]);
 
   if (loadError) {
     return (
@@ -178,7 +190,6 @@ export const ReviewPage = () => {
           </div>
         )}
 
-        {/* Video player */}
         <div className="rounded-xl overflow-hidden bg-black shadow-lg mb-4">
           <video
             src={videoSrc}
@@ -199,7 +210,6 @@ export const ReviewPage = () => {
           />
         </div>
 
-        {/* Metadata */}
         <div className="grid grid-cols-2 gap-3 mb-5 text-[13px]">
           <div className="rounded-lg border border-slate-200 px-3 py-2">
             <div className="text-[11px] text-slate-400 uppercase tracking-wide">Duration</div>
@@ -219,19 +229,37 @@ export const ReviewPage = () => {
           </div>
         </div>
 
-        {/* Submission stage indicator */}
-        {busy && (
+        {uploadBusy && (
           <div className="rounded-lg bg-blue-50 border border-blue-100 px-3.5 py-2.5 mb-4 flex items-center gap-3">
             <div className="w-4 h-4 border-2 border-blue-300 border-t-blue-600 rounded-full animate-spin" />
             <p className="text-[13px] text-blue-700">{stageLabel(stage)}</p>
           </div>
         )}
 
-        {/* Actions */}
+        <EvidenceReviewPanel
+          gate={evidence.gate}
+          proposedTask={evidence.proposedTask}
+          onProposedTaskChange={evidence.setProposedTask}
+          acceptanceText={evidence.acceptanceText}
+          onAcceptanceTextChange={evidence.setAcceptanceText}
+          stepsText={evidence.stepsText}
+          onStepsTextChange={evidence.setStepsText}
+          scope={evidence.scope}
+          onScopeChange={evidence.setScope}
+          projectWorkspace={evidence.projectWorkspace}
+          onProjectWorkspaceChange={evidence.setProjectWorkspace}
+          provider={evidence.provider}
+          onProviderChange={evidence.setProvider}
+          onExport={() => void evidence.exportBundle()}
+          onConfirm={() => void evidence.confirmReview()}
+          onContinue={handleContinueToTask}
+          busy={controlsLocked}
+        />
+
         <div className="flex flex-col gap-2">
           <button
             onClick={handleSubmit}
-            disabled={busy}
+            disabled={controlsLocked}
             className="w-full px-6 py-3 bg-gradient-to-b from-red-500 to-red-600 text-white text-[15px] font-semibold rounded-xl hover:from-red-600 hover:to-red-700 shadow-lg shadow-red-500/25 transition disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Submit
@@ -239,14 +267,14 @@ export const ReviewPage = () => {
           <div className="grid grid-cols-2 gap-2">
             <button
               onClick={handleRecordAgain}
-              disabled={busy}
+              disabled={controlsLocked}
               className="px-4 py-2.5 bg-white text-slate-700 text-[13px] font-medium rounded-lg border border-slate-200 hover:bg-slate-50 transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Record Again
             </button>
             <button
               onClick={handleDelete}
-              disabled={busy}
+              disabled={controlsLocked}
               className="px-4 py-2.5 bg-white text-red-600 text-[13px] font-medium rounded-lg border border-red-200 hover:bg-red-50 transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Delete

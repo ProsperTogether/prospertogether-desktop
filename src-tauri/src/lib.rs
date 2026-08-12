@@ -1,4 +1,5 @@
 mod commands;
+mod evidence;
 mod migration;
 mod state;
 pub mod capture_target;
@@ -51,6 +52,7 @@ pub fn run() {
                 .build(),
         )
         .manage(AppState::default())
+        .manage(commands::evidence_bundle::SessionSignerState::default())
         .invoke_handler(tauri::generate_handler![
             commands::recording::start_recording,
             commands::recording::stop_recording,
@@ -78,6 +80,12 @@ pub fn run() {
             commands::updater::check_for_update,
             commands::setup::test_audio,
             commands::setup::capture_screenshot,
+            commands::evidence_bundle::preview_evidence_bundle,
+            commands::evidence_bundle::export_evidence_bundle,
+            commands::evidence_bundle::validate_evidence_bundle,
+            commands::evidence_bundle::confirm_evidence_review,
+            commands::evidence_bundle::get_evidence_review_receipt,
+            commands::evidence_bundle::import_evidence_bundle,
         ])
         .setup(|app| {
             // Bundle-identifier migration: copy settings + orphaned state
