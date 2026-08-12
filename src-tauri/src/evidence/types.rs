@@ -189,7 +189,7 @@ pub struct EvidenceExportResult {
     pub encrypted_object_handoff_required: bool,
 }
 
-/// Public device identity only — never persist signing secrets here.
+/// Public device identity. This is safe to persist and to send to Portal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DevicePublicIdentity {
@@ -197,8 +197,11 @@ pub struct DevicePublicIdentity {
     pub device_key_id: String,
 }
 
-/// In-memory signing material. Must be injected; plaintext keys are not persisted.
-#[derive(Debug, Clone)]
+/// Signing material loaded into memory from OS-protected storage. The key is
+/// serialized only for the explicit enrollment bridge; it is never persisted
+/// as plaintext by the app.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
     pub device_id: String,
     pub device_key_id: String,

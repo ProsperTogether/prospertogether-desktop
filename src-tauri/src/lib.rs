@@ -82,6 +82,8 @@ pub fn run() {
             commands::setup::capture_screenshot,
             commands::evidence_bundle::preview_evidence_bundle,
             commands::evidence_bundle::export_evidence_bundle,
+            commands::evidence_bundle::get_evidence_device_identity,
+            commands::evidence_bundle::complete_evidence_enrollment,
             commands::evidence_bundle::validate_evidence_bundle,
             commands::evidence_bundle::confirm_evidence_review,
             commands::evidence_bundle::get_evidence_review_receipt,

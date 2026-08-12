@@ -2,6 +2,7 @@ pub mod canonical;
 pub mod crypto;
 pub mod export;
 pub mod index;
+pub mod key_store;
 pub mod limits;
 pub mod sign;
 pub mod types;

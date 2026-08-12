@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::commands::recordings::{
     recordings_root, PersistedCaptureTarget, RECORDING_METADATA_FILENAME,
 };
-use crate::evidence::crypto::{hex_decode, hmac_sha256_hex, sha256_hex};
+use crate::evidence::crypto::{hex_decode, hmac_sha256_hex};
 use crate::evidence::export::{empty_proposed_task, ExportRequest};
 use crate::evidence::index::{load_import_index, register_imported_bundle_id};
 use crate::evidence::limits::ALLOWED_SIG_ALG;
@@ -29,13 +29,6 @@ pub struct SessionSignerState {
     inner: Mutex<Option<DeviceIdentity>>,
 }
 
-#[derive(Debug, serde::Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistPublicIdentity {
-    device_id: String,
-    device_key_id: String,
-}
-
 fn evidence_root(app: &AppHandle) -> Result<PathBuf, String> {
     let root = app
         .path()
@@ -44,16 +37,6 @@ fn evidence_root(app: &AppHandle) -> Result<PathBuf, String> {
         .join("evidence");
     std::fs::create_dir_all(&root).map_err(|e| format!("create evidence root: {e}"))?;
     Ok(root)
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn iso8601_now() -> String {
@@ -133,7 +116,49 @@ fn load_recording_meta(
     Ok((folder, meta))
 }
 
-/// Session-scoped signer. Public device ids may be persisted; secrets stay in memory only.
+fn load_public_identity(path: &std::path::Path) -> Result<Option<DevicePublicIdentity>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|e| format!("public evidence identity corrupt: {e}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read public evidence identity: {error}")),
+    }
+}
+
+fn write_public_identity_atomic(
+    path: &std::path::Path,
+    identity: &DevicePublicIdentity,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "public evidence identity has no parent".to_string())?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|e| format!("create public evidence identity: {e}"))?;
+        let json = serde_json::to_vec_pretty(identity).map_err(|e| e.to_string())?;
+        file.write_all(&json)
+            .map_err(|e| format!("write public evidence identity: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync public evidence identity: {e}"))?;
+        std::fs::rename(&temporary, path)
+            .map_err(|e| format!("install public evidence identity: {e}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Session cache over the OS-protected enrolled signer. The protected record
+/// is authoritative; the adjacent public file contains no signing material.
 fn session_identity(app: &AppHandle, state: &SessionSignerState) -> Result<DeviceIdentity, String> {
     let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
     if let Some(existing) = guard.as_ref() {
@@ -141,40 +166,17 @@ fn session_identity(app: &AppHandle, state: &SessionSignerState) -> Result<Devic
     }
     let root = evidence_root(app)?;
     let public_path = root.join("device_public.json");
-    let (device_id, device_key_id) = if let Ok(raw) = std::fs::read_to_string(&public_path) {
-        let stored: PersistPublicIdentity =
-            serde_json::from_str(&raw).map_err(|e| format!("public identity corrupt: {e}"))?;
-        (stored.device_id, stored.device_key_id)
-    } else {
-        let a = uuid::Uuid::new_v4();
-        let b = uuid::Uuid::new_v4();
-        let mut raw = [0u8; 32];
-        raw[..16].copy_from_slice(a.as_bytes());
-        raw[16..].copy_from_slice(b.as_bytes());
-        let digest = sha256_hex(&raw);
-        let device_id = format!("devagent-{}", &digest[..12]);
-        let device_key_id = format!("key-{}", &digest[12..28]);
-        let stored = PersistPublicIdentity {
-            device_id: device_id.clone(),
-            device_key_id: device_key_id.clone(),
-        };
-        std::fs::write(
+    let public = load_public_identity(&public_path)?;
+    let identity = crate::evidence::key_store::load_or_create(&root, public.as_ref())?;
+    if public.is_none() {
+        write_public_identity_atomic(
             &public_path,
-            serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| format!("write public identity: {e}"))?;
-        (device_id, device_key_id)
-    };
-    let mut secret = [0u8; 32];
-    let a = uuid::Uuid::new_v4();
-    let b = uuid::Uuid::new_v4();
-    secret[..16].copy_from_slice(a.as_bytes());
-    secret[16..].copy_from_slice(b.as_bytes());
-    let identity = DeviceIdentity {
-        device_id,
-        device_key_id,
-        hmac_key_hex: hex_lower(&secret),
-    };
+            &DevicePublicIdentity {
+                device_id: identity.device_id.clone(),
+                device_key_id: identity.device_key_id.clone(),
+            },
+        )?;
+    }
     *guard = Some(identity.clone());
     Ok(identity)
 }
@@ -216,6 +218,55 @@ fn build_request(
         reviewer_user_id,
         evidence_root: root,
     })
+}
+
+/// Return the enrolled device identity for an explicit Portal enrollment or
+/// attestation flow. The signing key is loaded from OS-protected storage and
+/// is never read from a project/configuration file; callers must not persist
+/// the returned secret.
+#[tauri::command]
+pub async fn get_evidence_device_identity(
+    app: AppHandle,
+    signer: State<'_, SessionSignerState>,
+) -> Result<DeviceIdentity, String> {
+    session_identity(&app, &signer)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteEvidenceEnrollmentRequest {
+    pub device_id: String,
+    pub device_key_id: String,
+    /// One-time server-issued secret returned by Portal host enrollment.
+    pub enrollment_secret: String,
+}
+
+/// Persist Portal's one-time enrollment secret in OS-protected storage and
+/// make it the signer for subsequent exports. The request must name the
+/// already-created device identity; it cannot silently replace that identity.
+#[tauri::command]
+pub async fn complete_evidence_enrollment(
+    app: AppHandle,
+    signer: State<'_, SessionSignerState>,
+    request: CompleteEvidenceEnrollmentRequest,
+) -> Result<DevicePublicIdentity, String> {
+    let current = session_identity(&app, &signer)?;
+    if current.device_id != request.device_id || current.device_key_id != request.device_key_id {
+        return Err("Portal enrollment identity does not match this device".into());
+    }
+    let public = DevicePublicIdentity {
+        device_id: current.device_id,
+        device_key_id: current.device_key_id,
+    };
+    let root = evidence_root(&app)?;
+    let enrolled = crate::evidence::key_store::install_enrollment_secret(
+        &root,
+        &public,
+        &request.enrollment_secret,
+    )?;
+    let mut guard = signer.inner.lock().map_err(|e| e.to_string())?;
+    *guard = Some(enrolled);
+    Ok(public)
 }
 
 fn review_receipt_payload(receipt: &EvidenceReviewReceipt) -> Result<String, String> {
