@@ -14,6 +14,7 @@ import type {
 } from '../types/evidenceBundle';
 import {
   assertReviewedBeforeTaskCreate,
+  claimImportedBundleId,
   createTaskDraftFromBundle,
   mediaRefForBytes,
   registerImportedBundleId,
@@ -131,6 +132,42 @@ describe('EvidenceBundle v1 fixtures', () => {
     expect(validateEvidenceBundle(bundle, ctxFor(TEST_IDENTITY)).errors.some((e) => e.code === 'content_hash_mismatch')).toBe(true);
   });
 
+  it('rejects invalid timestamps and capture ranges beyond the bounded window', () => {
+    const invalidDate = asManifest(minimalFixture);
+    invalidDate.timeRange.startedAt = '2026-99-99T18:55:00.000Z';
+    const invalidReport = validateEvidenceBundle(
+      signedBundle(invalidDate, { 'art-1': new Uint8Array() }),
+      ctxFor(TEST_IDENTITY, [], false),
+    );
+    expect(invalidReport.errors.some((e) => e.code === 'invalid_bundle')).toBe(true);
+
+    const tooLong = asManifest(minimalFixture);
+    tooLong.timeRange.endedAt = '2026-08-20T19:00:00.000Z';
+    const longReport = validateEvidenceBundle(
+      signedBundle(tooLong, { 'art-1': new Uint8Array() }),
+      ctxFor(TEST_IDENTITY, [], false),
+    );
+    expect(longReport.errors.some((e) => e.code === 'bound_exceeded')).toBe(true);
+  });
+
+  it('rejects unsafe media paths and oversized in-memory artifacts', () => {
+    const unsafe = asManifest(minimalFixture);
+    unsafe.media[0].relativePath = 'C:/outside.webm';
+    const unsafeReport = validateEvidenceBundle(
+      signedBundle(unsafe, { 'art-1': new Uint8Array() }),
+      ctxFor(TEST_IDENTITY, [], false),
+    );
+    expect(unsafeReport.errors.some((e) => e.code === 'invalid_bundle')).toBe(true);
+
+    const oversized = asManifest(minimalFixture);
+    oversized.media[0].byteLength = Number.MAX_SAFE_INTEGER;
+    const oversizedReport = validateEvidenceBundle(
+      signedBundle(oversized, { 'art-1': new Uint8Array() }),
+      ctxFor(TEST_IDENTITY, [], false),
+    );
+    expect(oversizedReport.errors.some((e) => e.code === 'bound_exceeded')).toBe(true);
+  });
+
   it('rejects a tampered signed manifest', () => {
     const bundle = signedBundle(asManifest(minimalFixture), { 'art-1': new Uint8Array() });
     bundle.manifest.proposedTask = { ...bundle.manifest.proposedTask, title: 'tampered title' };
@@ -152,6 +189,19 @@ describe('EvidenceBundle v1 fixtures', () => {
     ).toBe(true);
   });
 
+  it('claims an import atomically and keeps export identity separate', () => {
+    const first = claimImportedBundleId({ bundleIds: [] }, 'bundle-1');
+    expect(first.accepted).toBe(true);
+    const second = claimImportedBundleId(first.index, 'bundle-1');
+    expect(second.accepted).toBe(false);
+    expect(second.index.bundleIds).toEqual(['bundle-1']);
+
+    const bundle = signedBundle(asManifest(minimalFixture), { 'art-1': new Uint8Array() });
+    expect(
+      validateEvidenceBundle(bundle, ctxFor(TEST_IDENTITY, ['11111111-1111-4111-8111-111111111111'], false)).ok,
+    ).toBe(true);
+  });
+
   it('refuses to create a Task draft before privacy review', () => {
     const unsigned = asManifest(minimalFixture);
     unsigned.review = { privacyReviewed: false, reviewedAt: null, reviewerUserId: null };
@@ -167,6 +217,44 @@ describe('EvidenceBundle v1 fixtures', () => {
     expect(report.ok).toBe(true);
     expect(draft?.scope).toBe('personal');
     expect(draft && 'running' in draft).toBe(false);
+  });
+
+  it('persists only reviewed selected media and transcript ids in the draft', () => {
+    const bundle = signedBundle(asManifest(fullFixture), { 'art-rec': utf8Bytes('abc'), 'art-shot': new Uint8Array() }, {
+      deviceId: 'dev-fixture-2',
+      deviceKeyId: 'key-fixture-2',
+      hmacKeyHex: '33'.repeat(32),
+    });
+    const { draft, report } = createTaskDraftFromBundle(
+      bundle,
+      ctxFor({ deviceId: 'dev-fixture-2', deviceKeyId: 'key-fixture-2', hmacKeyHex: '33'.repeat(32) }, [], false),
+      'managed',
+      'project/workspace',
+      'fixture-provider',
+      { selectedMediaIds: ['media-shot'], selectedTranscriptIds: ['seg-1'] },
+    );
+    expect(report.ok).toBe(true);
+    expect(draft?.selectedMediaIds).toEqual(['media-shot']);
+    expect(draft?.selectedTranscriptIds).toEqual(['seg-1']);
+  });
+
+  it('rejects selection of missing or redacted evidence', () => {
+    const bundle = signedBundle(asManifest(fullFixture), { 'art-rec': utf8Bytes('abc'), 'art-shot': new Uint8Array() }, {
+      deviceId: 'dev-fixture-2',
+      deviceKeyId: 'key-fixture-2',
+      hmacKeyHex: '33'.repeat(32),
+    });
+    const identity = { deviceId: 'dev-fixture-2', deviceKeyId: 'key-fixture-2', hmacKeyHex: '33'.repeat(32) };
+    const { draft, report } = createTaskDraftFromBundle(
+      bundle,
+      ctxFor(identity, [], false),
+      'personal',
+      null,
+      null,
+      { selectedMediaIds: ['missing-media'], selectedTranscriptIds: ['seg-2'] },
+    );
+    expect(draft).toBeNull();
+    expect(report.errors.some((e) => e.code === 'invalid_bundle')).toBe(true);
   });
 
   it('keeps media hashes separate from the manifest body', () => {

@@ -1,4 +1,4 @@
-use super::canonical::{canonical_json, unsigned_value};
+use super::canonical::canonical_json;
 use super::limits::ALLOWED_SIG_ALG;
 use super::types::{DeviceIdentity, EvidenceManifest, EvidenceSignature, SignerProvider};
 
@@ -6,7 +6,10 @@ pub fn signing_payload(bundle: &EvidenceManifest) -> Result<String, String> {
     let mut unsigned = bundle.clone();
     unsigned.signature = None;
     let value = serde_json::to_value(&unsigned).map_err(|e| e.to_string())?;
-    canonical_json(&unsigned_value(&value)?)
+    // Keep an explicit null signature in the signed payload. This is the
+    // canonical TS/Portal representation and makes cross-runtime signatures
+    // interoperable instead of silently hashing two different documents.
+    canonical_json(&value)
 }
 
 pub fn sign_manifest_with_provider(

@@ -17,6 +17,8 @@ export const EVIDENCE_BOUNDS = {
   maxPrivacyLabels: 8,
   maxBundleIdChars: 64,
   maxTimeZoneChars: 64,
+  maxPathChars: 512,
+  maxCaptureDurationMs: 7 * 24 * 60 * 60 * 1000,
   maxArtifactBytes: 512 * 1024 * 1024,
 } as const;
 
@@ -56,6 +58,7 @@ export type EvidenceIssueCode =
   | 'review_required'
   | 'unsigned_manifest'
   | 'bound_exceeded'
+  | 'encrypted_object_handoff_required'
   | 'invalid_bundle';
 
 export interface EvidenceContentHash {
@@ -181,6 +184,11 @@ export interface EvidenceValidationContext {
   importedBundleIds: string[];
   deviceKeys?: Record<string, string>;
   checkDuplicateImport?: boolean;
+}
+
+export interface EvidenceDraftSelection {
+  selectedMediaIds?: string[];
+  selectedTranscriptIds?: string[];
 }
 
 export interface EvidenceTaskDraft {

@@ -14,12 +14,15 @@ use tauri::{AppHandle, Manager, State};
 use crate::commands::recordings::{
     recordings_root, PersistedCaptureTarget, RECORDING_METADATA_FILENAME,
 };
-use crate::evidence::crypto::sha256_hex;
+use crate::evidence::crypto::{hex_decode, hmac_sha256_hex, sha256_hex};
 use crate::evidence::export::{empty_proposed_task, ExportRequest};
 use crate::evidence::index::{load_import_index, register_imported_bundle_id};
+use crate::evidence::limits::ALLOWED_SIG_ALG;
 use crate::evidence::sign::sign_manifest_with_provider;
 use crate::evidence::types::*;
-use crate::evidence::validate::{create_task_draft, validate_evidence_bundle};
+use crate::evidence::validate::{
+    create_task_draft_with_selection, validate_evidence_bundle as validate_manifest,
+};
 
 #[derive(Default)]
 pub struct SessionSignerState {
@@ -215,6 +218,61 @@ fn build_request(
     })
 }
 
+fn review_receipt_payload(receipt: &EvidenceReviewReceipt) -> Result<String, String> {
+    let mut value = serde_json::to_value(receipt).map_err(|e| e.to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "review receipt must be an object".to_string())?;
+    object.insert("signature".into(), serde_json::Value::Null);
+    crate::evidence::canonical::canonical_json(&value)
+}
+
+fn verify_review_receipt(
+    receipt: &EvidenceReviewReceipt,
+    identity: &DeviceIdentity,
+) -> Result<(), String> {
+    if receipt.signature.algorithm != ALLOWED_SIG_ALG
+        || receipt.signature.key_id != identity.device_key_id
+    {
+        return Err("review receipt signer is not trusted".into());
+    }
+    let key = hex_decode(&identity.hmac_key_hex)?;
+    let expected = hmac_sha256_hex(&key, review_receipt_payload(receipt)?.as_bytes());
+    if expected != receipt.signature.hex {
+        return Err("review receipt signature is invalid".into());
+    }
+    Ok(())
+}
+
+fn write_receipt_atomic(
+    path: &std::path::Path,
+    receipt: &EvidenceReviewReceipt,
+) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let json = serde_json::to_vec_pretty(receipt).map_err(|e| e.to_string())?;
+        let mut file =
+            std::fs::File::create(&temp).map_err(|e| format!("create temporary receipt: {e}"))?;
+        file.write_all(&json)
+            .map_err(|e| format!("write temporary receipt: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync temporary receipt: {e}"))?;
+        std::fs::rename(&temp, path).map_err(|e| format!("install receipt atomically: {e}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 #[tauri::command]
 pub async fn preview_evidence_bundle(
     app: AppHandle,
@@ -287,7 +345,7 @@ pub async fn validate_evidence_bundle(
         Some(id) => Some(load_recording_meta(&app, &id)?.0),
         None => None,
     };
-    Ok(validate_evidence_bundle(
+    Ok(validate_manifest(
         &bundle,
         &ValidationContext {
             trusted_key_ids: vec![identity.device_key_id.clone()],
@@ -328,7 +386,37 @@ pub async fn confirm_evidence_review(
     }
     let identity = session_identity(&app, &signer)?;
     let (folder, _) = load_recording_meta(&app, &request.recording_id)?;
-    let mut bundle = request.bundle;
+    let incoming_bundle = request.bundle;
+    let incoming_report = validate_manifest(
+        &incoming_bundle,
+        &ValidationContext {
+            trusted_key_ids: vec![identity.device_key_id.clone()],
+            imported_bundle_ids: vec![],
+            device_keys: [(
+                identity.device_key_id.clone(),
+                identity.hmac_key_hex.clone(),
+            )]
+            .into_iter()
+            .collect(),
+            artifacts: HashMap::new(),
+            media_root: Some(folder.clone()),
+            check_duplicate_import: false,
+        },
+    );
+    if !incoming_report.ok {
+        return Err(incoming_report
+            .errors
+            .into_iter()
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+    if incoming_bundle.source.device_id != identity.device_id
+        || incoming_bundle.source.device_key_id != identity.device_key_id
+    {
+        return Err("review requires a bundle signed by this authenticated device".into());
+    }
+    let mut bundle = incoming_bundle;
     bundle.proposed_task = request.proposed_task;
     bundle.review = EvidenceReview {
         privacy_reviewed: true,
@@ -352,12 +440,14 @@ pub async fn confirm_evidence_review(
         media_root: Some(folder),
         check_duplicate_import: false,
     };
-    let (mut draft, report) = create_task_draft(
+    let (draft, report) = create_task_draft_with_selection(
         &signed,
         &ctx,
         &request.scope,
         request.project_workspace,
         request.provider,
+        request.selected_media_ids.as_deref(),
+        request.selected_transcript_ids.as_deref(),
     );
     if !report.ok {
         return Err(report
@@ -367,13 +457,7 @@ pub async fn confirm_evidence_review(
             .collect::<Vec<_>>()
             .join("; "));
     }
-    let mut draft = draft.take().ok_or_else(|| "draft missing".to_string())?;
-    if let Some(ids) = request.selected_media_ids {
-        draft.selected_media_ids = ids;
-    }
-    if let Some(ids) = request.selected_transcript_ids {
-        draft.selected_transcript_ids = ids;
-    }
+    let draft = draft.ok_or_else(|| "draft missing".to_string())?;
     let receipt_id = uuid::Uuid::new_v4().to_string();
     let reviewed_at = iso8601_now();
     let mut receipt = EvidenceReviewReceipt {
@@ -388,38 +472,37 @@ pub async fn confirm_evidence_review(
             signed_at: reviewed_at,
         },
     };
-    let payload = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
-    let mut unsigned = payload.clone();
-    if let Some(obj) = unsigned.as_object_mut() {
-        obj.insert("signature".into(), serde_json::Value::Null);
-    }
-    let canonical = crate::evidence::canonical::canonical_json(&unsigned)?;
+    let canonical = review_receipt_payload(&receipt)?;
     receipt.signature.hex = provider.sign_hex(canonical.as_bytes())?;
 
     let root = evidence_root(&app)?;
     let receipt_dir = root.join("receipts");
     std::fs::create_dir_all(&receipt_dir).map_err(|e| e.to_string())?;
-    std::fs::write(
-        receipt_dir.join(format!("{receipt_id}.json")),
-        serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("write receipt: {e}"))?;
+    write_receipt_atomic(&receipt_dir.join(format!("{receipt_id}.json")), &receipt)?;
     Ok(receipt)
 }
 
 #[tauri::command]
 pub async fn get_evidence_review_receipt(
     app: AppHandle,
+    signer: State<'_, SessionSignerState>,
     receipt_id: String,
 ) -> Result<EvidenceReviewReceipt, String> {
-    if receipt_id.contains("..") || receipt_id.contains('/') || receipt_id.contains('\\') {
+    if uuid::Uuid::parse_str(&receipt_id).is_err() {
         return Err("invalid receipt id".into());
     }
+    let identity = session_identity(&app, &signer)?;
     let path = evidence_root(&app)?
         .join("receipts")
         .join(format!("{receipt_id}.json"));
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("receipt not found: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("receipt corrupt: {e}"))
+    let receipt: EvidenceReviewReceipt =
+        serde_json::from_str(&raw).map_err(|e| format!("receipt corrupt: {e}"))?;
+    if receipt.receipt_id != receipt_id {
+        return Err("receipt id does not match its filename".into());
+    }
+    verify_review_receipt(&receipt, &identity)?;
+    Ok(receipt)
 }
 
 /// Explicit import path — this is where duplicate/idempotency is enforced.
@@ -434,7 +517,7 @@ pub async fn import_evidence_bundle(
     let root = evidence_root(&app)?;
     let imported = load_import_index(&root)?;
     let folder = load_recording_meta(&app, &recording_id)?.0;
-    let report = validate_evidence_bundle(
+    let mut report = validate_manifest(
         &bundle,
         &ValidationContext {
             trusted_key_ids: vec![identity.device_key_id.clone()],
@@ -448,7 +531,68 @@ pub async fn import_evidence_bundle(
         },
     );
     if report.ok {
-        let _ = register_imported_bundle_id(&root, &bundle.bundle_id)?;
+        if !register_imported_bundle_id(&root, &bundle.bundle_id)? {
+            report.ok = false;
+            report.errors.push(EvidenceIssue {
+                code: "duplicate_import".into(),
+                message: format!("bundle {} was already imported", bundle.bundle_id),
+            });
+        }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod evidence_bundle_tests {
+    use super::*;
+    use crate::evidence::types::{InjectedHmacSigner, SignerProvider};
+
+    fn receipt(identity: &DeviceIdentity) -> EvidenceReviewReceipt {
+        let reviewed_at = "2026-08-11T19:00:00.000Z".to_string();
+        let mut receipt = EvidenceReviewReceipt {
+            receipt_id: "11111111-1111-4111-8111-111111111111".into(),
+            bundle_id: "22222222-2222-4222-8222-222222222222".into(),
+            reviewed_at: reviewed_at.clone(),
+            draft: EvidenceTaskDraft {
+                source_bundle_id: "22222222-2222-4222-8222-222222222222".into(),
+                title: "Reviewed task".into(),
+                summary: "Summary".into(),
+                acceptance_criteria: vec![],
+                steps: vec![],
+                selected_media_ids: vec!["media-1".into()],
+                selected_transcript_ids: vec![],
+                scope: "personal".into(),
+                project_workspace: None,
+                provider: None,
+            },
+            signature: EvidenceSignature {
+                algorithm: ALLOWED_SIG_ALG.into(),
+                key_id: identity.device_key_id.clone(),
+                hex: String::new(),
+                signed_at: reviewed_at,
+            },
+        };
+        let signer = InjectedHmacSigner {
+            identity: identity.clone(),
+        };
+        receipt.signature.hex = signer
+            .sign_hex(review_receipt_payload(&receipt).unwrap().as_bytes())
+            .unwrap();
+        receipt
+    }
+
+    #[test]
+    fn reviewed_receipt_is_authenticated_and_tamper_evident() {
+        let identity = crate::evidence::test_support::test_identity();
+        let receipt = receipt(&identity);
+        assert!(verify_review_receipt(&receipt, &identity).is_ok());
+
+        let mut tampered = receipt.clone();
+        tampered.draft.title = "Changed after review".into();
+        assert!(verify_review_receipt(&tampered, &identity).is_err());
+        assert!(
+            verify_review_receipt(&receipt, &crate::evidence::test_support::alt_identity())
+                .is_err()
+        );
+    }
 }

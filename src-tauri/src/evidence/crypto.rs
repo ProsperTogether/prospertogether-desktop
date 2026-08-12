@@ -154,6 +154,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn hash_file(path: &std::path::Path) -> Result<(u64, String), String> {
+    use super::limits::MAX_ARTIFACT_BYTES;
     use std::io::Read;
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
@@ -167,8 +168,15 @@ pub fn hash_file(path: &std::path::Path) -> Result<(u64, String), String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
         total += n as u64;
+        if total > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{} exceeds the {} byte artifact bound",
+                path.display(),
+                MAX_ARTIFACT_BYTES
+            ));
+        }
+        hasher.update(&buf[..n]);
     }
     Ok((total, hex_encode(&hasher.finalize())))
 }

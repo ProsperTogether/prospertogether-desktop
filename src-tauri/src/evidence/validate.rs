@@ -43,15 +43,93 @@ fn valid_sha(hex: &str) -> bool {
     hex.len() == 64 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
-fn looks_iso8601(value: &str) -> bool {
-    let b = value.as_bytes();
-    b.len() >= 20
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && value.ends_with('Z')
+fn parse_digits(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    bytes.iter().try_fold(0u32, |value, digit| {
+        value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+    })
+}
+
+fn leap_year(year: u32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+// Gregorian calendar day number relative to 1970-01-01.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let adjusted_year = year - if month <= 2 { 1 } else { 0 };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Parse the canonical UTC timestamp form used by EvidenceBundle v1.
+/// Returns milliseconds since Unix epoch only for real calendar values.
+fn timestamp_millis(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if !(bytes.len() == 20 || (22..=24).contains(&bytes.len()))
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || *bytes.last()? != b'Z'
+    {
+        return None;
+    }
+    if bytes.len() != 20 && bytes[19] != b'.' {
+        return None;
+    }
+    let year = parse_digits(&bytes[0..4])?;
+    let month = parse_digits(&bytes[5..7])?;
+    let day = parse_digits(&bytes[8..10])?;
+    let hour = parse_digits(&bytes[11..13])?;
+    let minute = parse_digits(&bytes[14..16])?;
+    let second = parse_digits(&bytes[17..19])?;
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let fraction_millis = if bytes.len() == 20 {
+        0
+    } else {
+        let fraction = parse_digits(&bytes[20..bytes.len() - 1])?;
+        match bytes.len() - 21 {
+            1 => fraction * 100,
+            2 => fraction * 10,
+            3 => fraction,
+            _ => return None,
+        }
+    };
+    let seconds = days_from_civil(year as i64, month as i64, day as i64)
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
+    seconds
+        .checked_mul(1_000)?
+        .checked_add(i64::from(fraction_millis))
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -76,14 +154,25 @@ fn valid_uuid(value: &str) -> bool {
     true
 }
 
+fn is_safe_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_BUNDLE_ID_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// Reject absolute paths, `..`, and backslashes. Relative names only.
 pub fn is_safe_relative_path(path: &str) -> bool {
     if path.is_empty()
-        || path.len() > 512
+        || path.len() > MAX_PATH_CHARS
         || path.starts_with('/')
         || path.starts_with('\\')
         || path.contains('\\')
         || path.contains('\0')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
     {
         return false;
     }
@@ -151,19 +240,28 @@ fn validate_structure(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
             ),
         ));
     }
-    if !looks_iso8601(&manifest.time_range.started_at)
-        || !looks_iso8601(&manifest.time_range.ended_at)
-        || !looks_iso8601(&manifest.exported_at)
+    let started_at = timestamp_millis(&manifest.time_range.started_at);
+    let ended_at = timestamp_millis(&manifest.time_range.ended_at);
+    if started_at.is_none()
+        || ended_at.is_none()
+        || timestamp_millis(&manifest.exported_at).is_none()
     {
         errors.push(issue(
             "invalid_bundle",
             "timestamps must be ISO-8601 UTC ending in Z",
         ));
-    } else if manifest.time_range.ended_at < manifest.time_range.started_at {
-        errors.push(issue(
-            "invalid_bundle",
-            "time_range.ended_at must be >= started_at",
-        ));
+    } else if let (Some(started_at), Some(ended_at)) = (started_at, ended_at) {
+        if ended_at < started_at {
+            errors.push(issue(
+                "invalid_bundle",
+                "time_range.ended_at must be >= started_at",
+            ));
+        } else if ended_at - started_at > MAX_CAPTURE_DURATION_MS {
+            errors.push(issue(
+                "bound_exceeded",
+                format!("time_range exceeds {MAX_CAPTURE_DURATION_MS}ms"),
+            ));
+        }
     }
     if manifest.source.device_id.is_empty() || manifest.source.device_key_id.is_empty() {
         errors.push(issue(
@@ -178,16 +276,26 @@ fn validate_structure(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
         ));
     }
     for segment in &manifest.transcript_segments {
+        if !is_safe_identifier(&segment.id) {
+            errors.push(issue(
+                "invalid_bundle",
+                format!("transcript segment {} has an invalid id", segment.id),
+            ));
+        }
         if segment.text.len() > MAX_SEGMENT_TEXT_BYTES {
             errors.push(issue(
                 "bound_exceeded",
                 format!("transcript segment {} exceeds text bound", segment.id),
             ));
         }
-        if looks_iso8601(&segment.started_at)
-            && looks_iso8601(&segment.ended_at)
-            && segment.ended_at < segment.started_at
-        {
+        let segment_started = timestamp_millis(&segment.started_at);
+        let segment_ended = timestamp_millis(&segment.ended_at);
+        if segment_started.is_none() || segment_ended.is_none() {
+            errors.push(issue(
+                "invalid_bundle",
+                format!("transcript segment {} has invalid timestamps", segment.id),
+            ));
+        } else if segment_ended < segment_started {
             errors.push(issue(
                 "invalid_bundle",
                 format!("transcript segment {} timing is inverted", segment.id),
@@ -204,6 +312,18 @@ fn validate_structure(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
             errors.push(issue(
                 "duplicate_media_id",
                 format!("duplicate media id {}", media.id),
+            ));
+        }
+        if !is_safe_identifier(&media.id) || !is_safe_identifier(&media.artifact_id) {
+            errors.push(issue(
+                "invalid_bundle",
+                format!("media {} has an invalid id", media.id),
+            ));
+        }
+        if !matches!(media.kind.as_str(), "recording" | "screenshot" | "audio") {
+            errors.push(issue(
+                "invalid_bundle",
+                format!("media {} has an unsupported kind", media.id),
             ));
         }
         if media.content_hash.algorithm != ALLOWED_HASH_ALG {
@@ -237,6 +357,14 @@ fn validate_structure(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
                 "invalid_bundle",
                 format!("media {} relative_path is unsafe", media.id),
             ));
+        }
+        if let Some(file_name) = media.file_name.as_deref() {
+            if !is_safe_relative_path(file_name) {
+                errors.push(issue(
+                    "invalid_bundle",
+                    format!("media {} file_name is unsafe", media.id),
+                ));
+            }
         }
         if media.protection != PROTECTION_NONE && media.protection != PROTECTION_ENCRYPTED_HANDOFF {
             errors.push(issue(
@@ -290,6 +418,54 @@ fn validate_structure(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
     if manifest.redactions.len() > MAX_REDACTIONS {
         errors.push(issue("bound_exceeded", "redactions exceeds bound"));
     }
+    for redaction in &manifest.redactions {
+        if !matches!(
+            redaction.target.as_str(),
+            "transcript" | "media" | "window" | "proposed_task"
+        ) {
+            errors.push(issue(
+                "invalid_bundle",
+                format!(
+                    "redaction {} has an unsupported target",
+                    redaction.target_id
+                ),
+            ));
+        }
+        if !is_safe_identifier(&redaction.target_id) {
+            errors.push(issue(
+                "invalid_bundle",
+                "redaction target id is missing or too long",
+            ));
+        }
+        if timestamp_millis(&redaction.redacted_at).is_none() {
+            errors.push(issue(
+                "invalid_bundle",
+                format!("redaction {} has an invalid timestamp", redaction.target_id),
+            ));
+        }
+    }
+    if let Some(reviewed_at) = manifest.review.reviewed_at.as_deref() {
+        if timestamp_millis(reviewed_at).is_none() {
+            errors.push(issue(
+                "invalid_bundle",
+                "reviewed_at must be a valid ISO-8601 UTC timestamp",
+            ));
+        }
+    }
+    if let Some(signature) = manifest.signature.as_ref() {
+        if signature.key_id.is_empty() || !valid_sha(&signature.hex) {
+            errors.push(issue(
+                "invalid_bundle",
+                "signature key_id and hex are required",
+            ));
+        }
+        if timestamp_millis(&signature.signed_at).is_none() {
+            errors.push(issue(
+                "invalid_bundle",
+                "signed_at must be a valid ISO-8601 UTC timestamp",
+            ));
+        }
+    }
     errors
 }
 
@@ -307,6 +483,19 @@ fn validate_redactions(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
         }
     }
     for redaction in &manifest.redactions {
+        if redaction.target == "media" {
+            if !manifest
+                .media
+                .iter()
+                .any(|media| media.id == redaction.target_id)
+            {
+                errors.push(issue(
+                    "invalid_bundle",
+                    format!("redaction target {} is missing", redaction.target_id),
+                ));
+            }
+            continue;
+        }
         if redaction.target != "transcript" {
             continue;
         }
@@ -334,88 +523,119 @@ fn validate_redactions(manifest: &EvidenceManifest) -> Vec<EvidenceIssue> {
     errors
 }
 
-fn media_bytes(
-    media: &EvidenceMediaRef,
-    ctx: &ValidationContext,
-) -> Result<Option<Vec<u8>>, Vec<EvidenceIssue>> {
-    if let Some(bytes) = ctx.artifacts.get(&media.artifact_id) {
-        return Ok(Some(bytes.clone()));
-    }
-    let Some(root) = ctx.media_root.as_ref() else {
-        return Err(vec![issue(
-            "missing_media",
-            format!("artifact {} is not present", media.artifact_id),
-        )]);
-    };
-    let candidates = [
-        media.file_name.as_deref(),
-        Some(media.relative_path.as_str()),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        match contained_join(root, candidate) {
-            Ok(path) if path.is_file() => {
-                let bytes = std::fs::read(&path).map_err(|e| {
-                    vec![issue(
-                        "missing_media",
-                        format!("artifact {} read failed: {e}", media.artifact_id),
-                    )]
-                })?;
-                return Ok(Some(bytes));
-            }
-            Ok(_) => continue,
-            Err(e) => {
-                return Err(vec![issue("invalid_bundle", e)]);
-            }
-        }
-    }
-    if media.protection == PROTECTION_ENCRYPTED_HANDOFF {
-        // Source may still live in the recording folder under file_name; if not found,
-        // treat as pending handoff rather than inventing encryption.
-        return Ok(None);
-    }
-    Err(vec![issue(
-        "missing_media",
-        format!("artifact {} is not present", media.artifact_id),
-    )])
-}
-
 fn validate_media(manifest: &EvidenceManifest, ctx: &ValidationContext) -> Vec<EvidenceIssue> {
     let mut errors = Vec::new();
     for media in &manifest.media {
-        match media_bytes(media, ctx) {
-            Err(inner) => errors.extend(inner),
-            Ok(None) if media.protection == PROTECTION_ENCRYPTED_HANDOFF => {
-                // Explicit handoff required; source retained elsewhere.
+        if let Some(bytes) = ctx.artifacts.get(&media.artifact_id) {
+            if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+                errors.push(issue(
+                    "bound_exceeded",
+                    format!("artifact {} exceeds size bound", media.artifact_id),
+                ));
+                continue;
             }
-            Ok(None) => errors.push(issue(
+            if bytes.len() as u64 != media.byte_length {
+                errors.push(issue(
+                    "content_hash_mismatch",
+                    format!(
+                        "artifact {} length {} != {}",
+                        media.artifact_id,
+                        bytes.len(),
+                        media.byte_length
+                    ),
+                ));
+            }
+            if sha256_hex(bytes) != media.content_hash.hex {
+                errors.push(issue(
+                    "content_hash_mismatch",
+                    format!(
+                        "artifact {} hash does not match the manifest",
+                        media.artifact_id
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        let Some(root) = ctx.media_root.as_ref() else {
+            if media.protection != PROTECTION_ENCRYPTED_HANDOFF {
+                errors.push(issue(
+                    "missing_media",
+                    format!("artifact {} is not present", media.artifact_id),
+                ));
+            }
+            continue;
+        };
+        let mut found = false;
+        let candidates = [
+            media.file_name.as_deref(),
+            Some(media.relative_path.as_str()),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            let path = match contained_join(root, candidate) {
+                Ok(path) => path,
+                Err(e) => {
+                    errors.push(issue("invalid_bundle", e));
+                    found = true;
+                    break;
+                }
+            };
+            if !path.is_file() {
+                continue;
+            }
+            found = true;
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    errors.push(issue(
+                        "missing_media",
+                        format!("artifact {} stat failed: {e}", media.artifact_id),
+                    ));
+                    break;
+                }
+            };
+            if metadata.len() > MAX_ARTIFACT_BYTES {
+                errors.push(issue(
+                    "bound_exceeded",
+                    format!("artifact {} exceeds size bound", media.artifact_id),
+                ));
+                break;
+            }
+            match hash_file(&path) {
+                Ok((byte_length, hash)) => {
+                    if byte_length != media.byte_length {
+                        errors.push(issue(
+                            "content_hash_mismatch",
+                            format!(
+                                "artifact {} length {} != {}",
+                                media.artifact_id, byte_length, media.byte_length
+                            ),
+                        ));
+                    }
+                    if hash != media.content_hash.hex {
+                        errors.push(issue(
+                            "content_hash_mismatch",
+                            format!(
+                                "artifact {} hash does not match the manifest",
+                                media.artifact_id
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => errors.push(issue(
+                    "missing_media",
+                    format!("artifact {} read failed: {e}", media.artifact_id),
+                )),
+            }
+            break;
+        }
+        if !found && media.protection != PROTECTION_ENCRYPTED_HANDOFF {
+            errors.push(issue(
                 "missing_media",
                 format!("artifact {} is not present", media.artifact_id),
-            )),
-            Ok(Some(bytes)) => {
-                if bytes.len() as u64 != media.byte_length {
-                    errors.push(issue(
-                        "content_hash_mismatch",
-                        format!(
-                            "artifact {} length {} != {}",
-                            media.artifact_id,
-                            bytes.len(),
-                            media.byte_length
-                        ),
-                    ));
-                }
-                if sha256_hex(&bytes) != media.content_hash.hex {
-                    errors.push(issue(
-                        "content_hash_mismatch",
-                        format!(
-                            "artifact {} hash does not match the manifest",
-                            media.artifact_id
-                        ),
-                    ));
-                }
-            }
+            ));
         }
     }
-    let _ = hash_file; // keep import available for callers
     errors
 }
 
@@ -518,14 +738,135 @@ pub fn create_task_draft(
     project_workspace: Option<String>,
     provider: Option<String>,
 ) -> (Option<EvidenceTaskDraft>, EvidenceValidationReport) {
+    create_task_draft_with_selection(
+        manifest,
+        ctx,
+        scope,
+        project_workspace,
+        provider,
+        None,
+        None,
+    )
+}
+
+fn selection_issue(code: &str, message: impl Into<String>) -> EvidenceIssue {
+    issue(code, message)
+}
+
+/// Resolve caller-selected evidence against the signed manifest. Explicit
+/// selections are never allowed to smuggle in missing or redacted content.
+pub fn resolve_task_selection(
+    manifest: &EvidenceManifest,
+    selected_media_ids: Option<&[String]>,
+    selected_transcript_ids: Option<&[String]>,
+) -> Result<(Vec<String>, Vec<String>), Vec<EvidenceIssue>> {
+    let mut errors = Vec::new();
+    let default_media: Vec<String> = manifest
+        .media
+        .iter()
+        .map(|media| media.id.clone())
+        .collect();
+    let default_transcript: Vec<String> = manifest
+        .transcript_segments
+        .iter()
+        .filter(|segment| !segment.redacted)
+        .map(|segment| segment.id.clone())
+        .collect();
+    let media_ids = selected_media_ids.unwrap_or(&default_media);
+    let transcript_ids = selected_transcript_ids.unwrap_or(&default_transcript);
+
+    let mut seen_media = std::collections::HashSet::new();
+    let redacted_media: std::collections::HashSet<&str> = manifest
+        .redactions
+        .iter()
+        .filter(|redaction| redaction.target == "media")
+        .map(|redaction| redaction.target_id.as_str())
+        .collect();
+    for id in media_ids {
+        if !seen_media.insert(id.as_str()) {
+            errors.push(selection_issue(
+                "invalid_bundle",
+                format!("media {id} was selected more than once"),
+            ));
+            continue;
+        }
+        let Some(media) = manifest.media.iter().find(|media| media.id == *id) else {
+            errors.push(selection_issue(
+                "invalid_bundle",
+                format!("selected media {id} is not in the manifest"),
+            ));
+            continue;
+        };
+        if redacted_media.contains(id.as_str()) {
+            errors.push(selection_issue(
+                "invalid_bundle",
+                format!("selected media {id} is redacted"),
+            ));
+        }
+        if media.protection == PROTECTION_ENCRYPTED_HANDOFF {
+            errors.push(selection_issue(
+                "encrypted_object_handoff_required",
+                format!("selected media {id} requires an unavailable encrypted-object handoff"),
+            ));
+        }
+    }
+
+    let mut seen_transcript = std::collections::HashSet::new();
+    for id in transcript_ids {
+        if !seen_transcript.insert(id.as_str()) {
+            errors.push(selection_issue(
+                "invalid_bundle",
+                format!("transcript {id} was selected more than once"),
+            ));
+            continue;
+        }
+        let Some(segment) = manifest
+            .transcript_segments
+            .iter()
+            .find(|segment| segment.id == *id)
+        else {
+            errors.push(selection_issue(
+                "invalid_bundle",
+                format!("selected transcript {id} is not in the manifest"),
+            ));
+            continue;
+        };
+        if segment.redacted {
+            errors.push(selection_issue(
+                "invalid_bundle",
+                format!("selected transcript {id} is redacted"),
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok((media_ids.to_vec(), transcript_ids.to_vec()))
+    } else {
+        Err(errors)
+    }
+}
+
+pub fn create_task_draft_with_selection(
+    manifest: &EvidenceManifest,
+    ctx: &ValidationContext,
+    scope: &str,
+    project_workspace: Option<String>,
+    provider: Option<String>,
+    selected_media_ids: Option<&[String]>,
+    selected_transcript_ids: Option<&[String]>,
+) -> (Option<EvidenceTaskDraft>, EvidenceValidationReport) {
     let mut report = validate_evidence_bundle(manifest, ctx);
     report
         .errors
         .extend(assert_reviewed_before_task_create(manifest));
+    let selection = resolve_task_selection(manifest, selected_media_ids, selected_transcript_ids);
+    if let Err(selection_errors) = &selection {
+        report.errors.extend(selection_errors.clone());
+    }
     report.ok = report.errors.is_empty();
     if !report.ok {
         return (None, report);
     }
+    let (selected_media_ids, selected_transcript_ids) = selection.expect("selection checked above");
     (
         Some(EvidenceTaskDraft {
             source_bundle_id: manifest.bundle_id.clone(),
@@ -533,13 +874,8 @@ pub fn create_task_draft(
             summary: manifest.proposed_task.summary.clone(),
             acceptance_criteria: manifest.proposed_task.acceptance_criteria.clone(),
             steps: manifest.proposed_task.steps.clone(),
-            selected_media_ids: manifest.media.iter().map(|m| m.id.clone()).collect(),
-            selected_transcript_ids: manifest
-                .transcript_segments
-                .iter()
-                .filter(|s| !s.redacted)
-                .map(|s| s.id.clone())
-                .collect(),
+            selected_media_ids,
+            selected_transcript_ids,
             scope: scope.into(),
             project_workspace,
             provider,

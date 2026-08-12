@@ -1,5 +1,5 @@
 mod commands;
-mod evidence;
+pub mod evidence;
 mod migration;
 mod state;
 pub mod capture_target;
